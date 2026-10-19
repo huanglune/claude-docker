@@ -1,0 +1,14 @@
+.env
+.env.*
+accounts/*.toml
+accounts/*.download-domains.txt
+accounts/*.resolv.conf
+!accounts/example.toml
+!accounts/example.resolv.conf
+proxy/claude-resolv.conf
+workspace/*
+!workspace/.gitkeep
+__pycache__/
+*.py[cod]
+*.log
+.DS_Store

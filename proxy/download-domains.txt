@@ -1,0 +1,62 @@
+# One domain suffix per line. Lines can include comments after "#".
+# These domains use DOWNLOAD_PROXY_URI instead of the default PROXY_URI.
+
+# Hugging Face original endpoints
+huggingface.co
+hf.co
+xethub.hf.co
+
+# Large release and package assets
+github.com
+github-releases.githubusercontent.com
+release-assets.githubusercontent.com
+objects.githubusercontent.com
+codeload.github.com
+raw.githubusercontent.com
+
+# npm, Node.js and nvm
+registry.npmjs.org
+npmjs.org
+npmjs.com
+nodejs.org
+nodesource.com
+deb.nodesource.com
+
+# System package repositories
+archive.ubuntu.com
+security.ubuntu.com
+ports.ubuntu.com
+ubuntu.com
+deb.debian.org
+security.debian.org
+debian.org
+packages.debian.org
+developer.download.nvidia.com
+developer.download.nvidia.cn
+download.docker.com
+packages.microsoft.com
+packages.cloud.google.com
+apt.llvm.org
+ppa.launchpadcontent.net
+launchpad.net
+
+# uv, Python and PyPI
+astral.sh
+pypi.org
+pythonhosted.org
+python.org
+bootstrap.pypa.io
+
+# Conda, Anaconda and conda-forge
+anaconda.org
+anaconda.com
+repo.anaconda.com
+conda.anaconda.org
+mamba.pm
+micromamba.snakepit.net
+
+# ML package mirrors and wheels
+download.pytorch.org
+
+# Network test target
+speed.cloudflare.com

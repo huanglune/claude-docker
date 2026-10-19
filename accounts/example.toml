@@ -1,0 +1,67 @@
+# 这是账号环境模板。请优先运行
+# `uv run scripts/account-env.py create <账号名>` 生成权限为 0600 的私有配置，
+# 不要直接在这个受 Git 跟踪的文件里填写真实代理 URI。
+schema = 1
+name = "claude-docker-example"
+
+[environment]
+# 隔离镜像标签
+PROXY_IMAGE = "claude-docker-example-proxy:local"
+CLAUDE_IMAGE = "claude-docker-example-nvidia:local"
+
+# 每个账号自己的代理配置。proxy-only 模式要求服务器部分为 IPv4，TLS SNI 可保留域名。
+# 只有一条代理时，DOWNLOAD_PROXY_URI 可以与 PROXY_URI 完全相同。
+PROXY_URI = "vless://uuid@192.0.2.10:443?security=reality&type=tcp&sni=proxy.example.com&fp=chrome&flow=xtls-rprx-vision&sid=shortid&pbk=publickey"
+DOWNLOAD_PROXY_URI = "vless://uuid@192.0.2.11:443?security=reality&type=tcp&sni=download.example.com&fp=chrome&flow=xtls-rprx-vision&sid=shortid&pbk=publickey"
+DOWNLOAD_DOMAIN_SOURCE = "./proxy/download-domains.txt"
+DOWNLOAD_DOMAIN_FILE = "/etc/sing-box/download-domains.txt"
+DNS_SERVER = "8.8.8.8"
+TUN_ADDRESS = "100.64.0.1/30"
+TUN_MTU = "9000"
+LOG_LEVEL = "warn"
+DNS_HIJACK = "false"
+SINGBOX_VERSION = "1.11.4"
+TZ = "America/Los_Angeles"
+
+# 宿主目录必须按账号分开；首次 up 时管理脚本会自动创建。
+HOST_WORKSPACE = "/srv/claude-docker/example/workspace"
+HOST_FAST_SSD = "/srv/claude-docker/example/md1"
+
+# 容器用户通常与宿主用户保持一致。
+CLAUDE_USER = "claude"
+CLAUDE_UID = "1000"
+CLAUDE_GID = "1000"
+CLAUDE_HOME = "/home/claude"
+CLAUDE_RESOLV_CONF_SOURCE = "./accounts/example.resolv.conf"
+CLAUDE_EXTRA_APT_PACKAGES = "vim btop htop cmake build-essential libaio-dev gh libevent-dev libncurses-dev bison pkg-config fio iotop rsync gdb hwloc valgrind"
+
+# 容器内缓存路径；最终分别落在本账号的 workspace/md1 绑定目录。
+CLAUDE_TMPDIR = "/home/claude/md1/tmp"
+CLAUDE_XDG_CACHE_HOME = "/home/claude/md1/cache"
+CLAUDE_NPM_CONFIG_CACHE = "/home/claude/md1/cache/npm"
+CLAUDE_PIP_CACHE_DIR = "/home/claude/md1/cache/pip"
+CLAUDE_UV_CACHE_DIR = "/home/claude/workspace/.cache/uv"
+CLAUDE_UV_PYTHON_INSTALL_DIR = "/home/claude/workspace/.cache/uv/python"
+CLAUDE_HF_HOME = "/home/claude/workspace/.cache/huggingface"
+CLAUDE_HF_ENDPOINT = "https://huggingface.co"
+CLAUDE_TOKENIZERS_PARALLELISM = "false"
+# 可填 all、0、1 或 0,1。Docker 层仍请求 GPU，容器内只显示这里指定的设备。
+CLAUDE_NVIDIA_VISIBLE_DEVICES = "all"
+
+# 同一宿主机上的每个账号必须使用不同 /24 子网。
+LOCKED_SUBNET = "172.30.99.0/24"
+PROXY_IP = "172.30.99.2"
+CLAUDE_IP = "172.30.99.10"
+DIRECT_PROXY_LISTEN = "172.30.99.2"
+DIRECT_PROXY_PORT = "12345"
+ROUTE_EXCLUDE_CIDRS = "172.30.99.0/24"
+BLOCK_PRIVATE_CIDRS = "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,100.64.0.0/10"
+# 可选的精确私网例外；只接受单个 IPv4（/32）和 TCP 端口，不接受网段或公网地址。
+PRIVATE_TCP_ALLOWLIST = ""
+
+# 强制代理模式：业务流量只能通过 PROXY_URI 或 DOWNLOAD_PROXY_URI。
+PROXY_ONLY = "true"
+# 可选出口国家观测；留空表示不按国家限制，只验证是否存在直连回落。
+EXIT_COUNTRY_DENYLIST = ""
+EXIT_COUNTRY_CHECK_URL = "https://www.cloudflare.com/cdn-cgi/trace"
+EXIT_COUNTRY_CHECK_INTERVAL = "60"

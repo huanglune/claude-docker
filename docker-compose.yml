@@ -1,0 +1,179 @@
+name: claude-docker
+
+services:
+  proxy:
+    build:
+      context: ./proxy
+      args:
+        SINGBOX_VERSION: ${SINGBOX_VERSION:?SINGBOX_VERSION is required}
+        CONTAINER_TZ: ${TZ:?TZ is required}
+    image: ${PROXY_IMAGE:-claude-docker-proxy:local}
+    environment:
+      CONFIG_SOURCE: ${CLAUDE_CONFIG_SOURCE:?use uv run scripts/account-env.py with an account TOML}
+      PROXY_URI: ${PROXY_URI:?PROXY_URI is required}
+      DOWNLOAD_PROXY_URI: ${DOWNLOAD_PROXY_URI:-}
+      DOWNLOAD_DOMAIN_FILE: ${DOWNLOAD_DOMAIN_FILE:?DOWNLOAD_DOMAIN_FILE is required}
+      TZ: ${TZ:?TZ is required}
+      PROXY_IP: ${PROXY_IP:?PROXY_IP is required}
+      DIRECT_PROXY_LISTEN: ${DIRECT_PROXY_LISTEN:?DIRECT_PROXY_LISTEN is required}
+      DIRECT_PROXY_PORT: ${DIRECT_PROXY_PORT:?DIRECT_PROXY_PORT is required}
+      DNS_SERVER: ${DNS_SERVER:?DNS_SERVER is required}
+      TUN_ADDRESS: ${TUN_ADDRESS:?TUN_ADDRESS is required}
+      TUN_MTU: ${TUN_MTU:?TUN_MTU is required}
+      LOG_LEVEL: ${LOG_LEVEL:?LOG_LEVEL is required}
+      DNS_HIJACK: ${DNS_HIJACK:?DNS_HIJACK is required}
+      LOCKED_SUBNET: ${LOCKED_SUBNET:?LOCKED_SUBNET is required}
+      ROUTE_EXCLUDE_CIDRS: ${ROUTE_EXCLUDE_CIDRS:?ROUTE_EXCLUDE_CIDRS is required}
+      BLOCK_PRIVATE_CIDRS: ${BLOCK_PRIVATE_CIDRS:?BLOCK_PRIVATE_CIDRS is required}
+      PRIVATE_TCP_ALLOWLIST: ${PRIVATE_TCP_ALLOWLIST:-}
+      PROXY_ONLY: ${PROXY_ONLY:-${STRICT_EGRESS:-false}}
+      EXIT_COUNTRY_DENYLIST: ${EXIT_COUNTRY_DENYLIST:-}
+      EXIT_COUNTRY_CHECK_URL: ${EXIT_COUNTRY_CHECK_URL:-https://www.cloudflare.com/cdn-cgi/trace}
+      EXIT_COUNTRY_CHECK_INTERVAL: ${EXIT_COUNTRY_CHECK_INTERVAL:-60}
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    volumes:
+      - type: bind
+        source: ${DOWNLOAD_DOMAIN_SOURCE:-./proxy/download-domains.txt}
+        target: ${DOWNLOAD_DOMAIN_FILE:?DOWNLOAD_DOMAIN_FILE is required}
+        read_only: true
+    sysctls:
+      net.ipv4.ip_forward: "1"
+      net.ipv6.conf.all.disable_ipv6: "1"
+      net.ipv6.conf.default.disable_ipv6: "1"
+      net.ipv6.conf.lo.disable_ipv6: "1"
+    networks:
+      egress: {}
+      locked:
+        ipv4_address: ${PROXY_IP:?PROXY_IP is required}
+    dns_search:
+      - .
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sS -I --connect-timeout 5 --max-time 8 https://api.anthropic.com >/dev/null"]
+      interval: 20s
+      timeout: 10s
+      retries: 6
+      start_period: 10s
+    restart: unless-stopped
+
+  claude:
+    build:
+      context: ./claude
+      args:
+        CLAUDE_USER: ${CLAUDE_USER:?CLAUDE_USER is required}
+        CLAUDE_UID: ${CLAUDE_UID:?CLAUDE_UID is required}
+        CLAUDE_GID: ${CLAUDE_GID:?CLAUDE_GID is required}
+        CONTAINER_TZ: ${TZ:?TZ is required}
+        CLAUDE_EXTRA_APT_PACKAGES: ${CLAUDE_EXTRA_APT_PACKAGES:-}
+    image: ${CLAUDE_IMAGE:-claude-docker-nvidia:local}
+    depends_on:
+      proxy:
+        condition: service_healthy
+      network-guard:
+        condition: service_healthy
+    gpus: all
+    security_opt:
+      - seccomp=unconfined
+    cap_drop:
+      - NET_ADMIN
+      - NET_RAW
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    network_mode: service:network-guard
+    user: ${CLAUDE_UID:?CLAUDE_UID is required}:${CLAUDE_GID:?CLAUDE_GID is required}
+    environment:
+      NVIDIA_VISIBLE_DEVICES: ${CLAUDE_NVIDIA_VISIBLE_DEVICES:-all}
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      HOME: ${CLAUDE_HOME:?CLAUDE_HOME is required}
+      USER: ${CLAUDE_USER:?CLAUDE_USER is required}
+      LOGNAME: ${CLAUDE_USER:?CLAUDE_USER is required}
+      TZ: ${TZ:?TZ is required}
+      TMPDIR: ${CLAUDE_TMPDIR:?CLAUDE_TMPDIR is required}
+      XDG_CACHE_HOME: ${CLAUDE_XDG_CACHE_HOME:?CLAUDE_XDG_CACHE_HOME is required}
+      NPM_CONFIG_CACHE: ${CLAUDE_NPM_CONFIG_CACHE:?CLAUDE_NPM_CONFIG_CACHE is required}
+      PIP_CACHE_DIR: ${CLAUDE_PIP_CACHE_DIR:?CLAUDE_PIP_CACHE_DIR is required}
+      UV_CACHE_DIR: ${CLAUDE_UV_CACHE_DIR:?CLAUDE_UV_CACHE_DIR is required}
+      UV_PYTHON_INSTALL_DIR: ${CLAUDE_UV_PYTHON_INSTALL_DIR:?CLAUDE_UV_PYTHON_INSTALL_DIR is required}
+      HF_HOME: ${CLAUDE_HF_HOME:?CLAUDE_HF_HOME is required}
+      HF_ENDPOINT: ${CLAUDE_HF_ENDPOINT:?CLAUDE_HF_ENDPOINT is required}
+      TOKENIZERS_PARALLELISM: ${CLAUDE_TOKENIZERS_PARALLELISM:?CLAUDE_TOKENIZERS_PARALLELISM is required}
+    volumes:
+      - claude-home:${CLAUDE_HOME:?CLAUDE_HOME is required}
+      - type: bind
+        source: ${CLAUDE_RESOLV_CONF_SOURCE:-./proxy/claude-resolv.conf}
+        target: /etc/resolv.conf
+        read_only: true
+      - type: bind
+        source: ${HOST_WORKSPACE:?HOST_WORKSPACE is required}
+        target: ${CLAUDE_HOME:?CLAUDE_HOME is required}/workspace
+      - type: bind
+        source: ${HOST_FAST_SSD:?HOST_FAST_SSD is required}
+        target: ${CLAUDE_HOME:?CLAUDE_HOME is required}/md1
+    working_dir: ${CLAUDE_HOME:?CLAUDE_HOME is required}/workspace
+    stdin_open: true
+    tty: true
+    command: ["sleep", "infinity"]
+    restart: unless-stopped
+
+  network-guard:
+    build:
+      context: ./network-guard
+    image: claude-docker-network-guard:local
+    depends_on:
+      proxy:
+        condition: service_healthy
+    environment:
+      PROXY_IP: ${PROXY_IP:?PROXY_IP is required}
+      LOCKED_SUBNET: ${LOCKED_SUBNET:?LOCKED_SUBNET is required}
+      BLOCK_PRIVATE_CIDRS: ${BLOCK_PRIVATE_CIDRS:?BLOCK_PRIVATE_CIDRS is required}
+      PRIVATE_TCP_ALLOWLIST: ${PRIVATE_TCP_ALLOWLIST:-}
+      PROXY_ONLY: ${PROXY_ONLY:-${STRICT_EGRESS:-false}}
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_ADMIN
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /run:rw,noexec,nosuid,size=1m
+      - /tmp:rw,noexec,nosuid,size=1m
+    entrypoint: ["/usr/local/bin/network-guard.sh"]
+    networks:
+      locked:
+        ipv4_address: ${CLAUDE_IP:?CLAUDE_IP is required}
+    dns:
+      - ${PROXY_IP:?PROXY_IP is required}
+    dns_search:
+      - .
+    sysctls:
+      net.ipv6.conf.all.disable_ipv6: "1"
+      net.ipv6.conf.default.disable_ipv6: "1"
+      net.ipv6.conf.lo.disable_ipv6: "1"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/network-guard.sh", "check"]
+      interval: 5s
+      timeout: 3s
+      retries: 6
+      start_period: 2s
+    restart: unless-stopped
+
+networks:
+  egress:
+    driver: bridge
+    enable_ipv6: false
+  locked:
+    driver: bridge
+    internal: true
+    enable_ipv6: false
+    ipam:
+      config:
+        - subnet: ${LOCKED_SUBNET:?LOCKED_SUBNET is required}
+
+volumes:
+  claude-home:
