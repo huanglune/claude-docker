@@ -577,7 +577,12 @@ main() {
   install_ipv6_block
 
   require_env PROXY_IP
+  require_env DIRECT_PROXY_LISTEN
   require_env LOCKED_SUBNET
+  if [[ "$PROXY_IP" == "0.0.0.0" || "$DIRECT_PROXY_LISTEN" == "0.0.0.0" ]]; then
+    log "refusing to listen on 0.0.0.0"
+    exit 1
+  fi
   activate_client_guard
 
   require_env PROXY_URI

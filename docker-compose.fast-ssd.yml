@@ -1,0 +1,7 @@
+# Optional extension. Included only when HOST_FAST_SSD is set.
+services:
+  claude:
+    volumes:
+      - type: bind
+        source: ${HOST_FAST_SSD:?HOST_FAST_SSD is required}
+        target: ${CLAUDE_HOME:?CLAUDE_HOME is required}/md1

@@ -1,0 +1,20 @@
+# Powerlevel10k instant prompt. Keep this near the top of ~/.zshrc.
+if [[ -r "${XDG_CACHE_HOME:-$HOME/.cache}/p10k-instant-prompt-${(%):-%n}.zsh" ]]; then
+  source "${XDG_CACHE_HOME:-$HOME/.cache}/p10k-instant-prompt-${(%):-%n}.zsh"
+fi
+
+export ZSH=/usr/local/share/oh-my-zsh
+export ZSH_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/oh-my-zsh"
+export GITSTATUS_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/gitstatus"
+mkdir -p "$ZSH_CACHE_DIR" "$GITSTATUS_CACHE_DIR"
+ZSH_THEME="powerlevel10k/powerlevel10k"
+zstyle ':omz:update' mode disabled
+plugins=(
+  git
+  zsh-autosuggestions
+  zsh-syntax-highlighting
+)
+source "$ZSH/oh-my-zsh.sh"
+
+# Absent ~/.p10k.zsh makes the next interactive shell run `p10k configure`.
+[[ ! -f ~/.p10k.zsh ]] || source ~/.p10k.zsh

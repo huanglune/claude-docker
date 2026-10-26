@@ -21,10 +21,8 @@ fi
 
 env_value() {
   local key="$1"
-  if [[ -v "$key" ]]; then
-    printf '%s\n' "${!key}"
-  fi
-  return 0
+  [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 0
+  printenv "$key" || true
 }
 
 ok() {

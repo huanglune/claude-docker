@@ -1,13 +1,13 @@
 # Claude Docker
 
-Claude Code 的隔离运行环境。Claude 运行在独立容器中，不配置代理环境变量、看不到 `tun0`；所有流量经 `network-guard` 持有的网络命名空间交给 `proxy` 容器里的 sing-box 网关。默认支持 NVIDIA GPU。
+Claude Code 的隔离运行环境。Claude 运行在独立容器中，不配置代理环境变量、看不到 `tun0`；所有流量经 `network-guard` 持有的网络命名空间交给 `proxy` 容器里的 sing-box 网关。默认使用 CPU 镜像，不申请 GPU。
 
 适合在单台受控 Linux 主机上隔离 Claude Code 的网络与工作数据，**不是多租户安全沙箱**。宿主机 root、Docker daemon、网络内核和上游代理仍属于可信边界；容器内的 Claude 用户可以免密 `sudo`，只是没有 `NET_ADMIN` / `NET_RAW` capability。
 
 ## 组件
 
 - `proxy`：sing-box TUN 网关、dnsmasq DNS forwarder、下载分流域名、内网 TCP 精确放行和出站 kill switch。
-- `claude`：Claude Code 运行容器，基于通用 `ubuntu:22.04`；NVIDIA 驱动和 `nvidia-smi` 由宿主机的 Container Toolkit 在启动时注入，镜像不预装 CUDA/cuDNN。使用 `seccomp=unconfined`（放行 `io_uring`），`nofile=1048576`，显式移除 `NET_ADMIN` / `NET_RAW`。镜像标签中的 `nvidia` 是历史命名。
+- `claude`：Claude Code 运行容器，基于通用 `ubuntu:22.04` CPU 镜像，不申请 GPU，也不预装 CUDA/cuDNN。使用 `seccomp=unconfined`（放行 `io_uring`），`nofile=1048576`，显式移除 `NET_ADMIN` / `NET_RAW`。默认镜像标签是 `cpu`。新家目录会从镜像骨架复制 zsh 配置：Powerlevel10k、git 补全、zsh-autosuggestions 和 zsh-syntax-highlighting；没有 `~/.p10k.zsh` 时，下次交互式 shell 会进入主题配置向导。
 - `network-guard`：最小 Debian 镜像，持有 Claude 的网络命名空间并持续校验/修复路由和防火墙；容器只加回 `NET_ADMIN`，根文件系统只读，每 2 秒检查一次漂移。
 - `accounts/<账号>.toml`：一个账号环境的唯一配置来源，包含代理、网络、用户、路径等参数。真实文件权限必须为 `0600`。
 - `proxy/download-domains.txt`：下载分流域名模板；`create` 会复制成账号专属的 `accounts/<账号>.download-domains.txt`。
@@ -29,11 +29,10 @@ accounts/example.toml
 
 - Linux 主机，Docker Engine + Docker Compose v2，当前用户可访问 Docker。
 - 主机存在 `/dev/net/tun`；proxy 容器需要 `NET_ADMIN` / `NET_RAW`，guard 需要 `NET_ADMIN`。
-- 已安装 NVIDIA 驱动和 NVIDIA Container Toolkit。Compose 使用 `gpus: all`，claude 的基础镜像不需要预装 CUDA，但宿主机必须支持 `docker run --gpus all nvidia-smi`；没有 GPU 的主机不能直接启动该栈。
 - 已安装 `uv`（管理 `scripts/account-env.py` 的 Python 运行环境）。
 - `net-test` 在宿主机上还需要 `python3`。
 - 上游代理可用，`PROXY_URI` / `DOWNLOAD_PROXY_URI` 的服务器部分必须是 IPv4 字面量；TLS SNI 仍可写域名。
-- `HOST_WORKSPACE` / `HOST_FAST_SSD` 指向可写的宿主机绝对路径。`up` 会创建缺失的目录并检查容器 uid/gid 的写权限。
+- `HOST_WORKSPACE` 指向可写的宿主机绝对路径。`HOST_FAST_SSD` 默认为空；填写后才额外挂载到容器 `$HOME/md1`。`up` 会创建缺失的目录并检查容器 uid/gid 的写权限。
 
 ## 快速开始
 
@@ -65,7 +64,7 @@ uv run scripts/account-env.py create work
 `create` 会：
 
 - 以当前宿主用户（`SUDO_UID` 感知）生成容器用户名、UID/GID 和 HOME；
-- 默认生成 `~/workspace/claude-accounts/work`、`~/md1/claude-accounts/work`；
+- 默认生成 `~/workspace/claude-accounts/work`；`HOST_FAST_SSD` 留空；
 - 从 `172.30.21.0/24` 起分配一个未被 Docker 网络和其它账号 TOML 占用的 `/24`；
 - 生成账号 TOML（`0600`）、下载域名表和 resolver 文件；
 - 如果同名容器、卷、网络或宿主目录已存在，拒绝继续。
@@ -140,14 +139,14 @@ uv run scripts/account-env.py compose <账号> config --services
 | `accounts/<账号>.download-domains.txt` | 下载分流域名，一行一个后缀，支持 `#` 注释。 |
 | `accounts/<账号>.resolv.conf` | Claude 的只读 resolver；内容必须只有 `nameserver <PROXY_IP>` 和 `options edns0 trust-ad ndots:0`，不可被 group/other 写入。 |
 | `<project>_claude-home` | 登录状态、HOME 配置；默认账号是 `claude-docker_claude-home`。 |
-| `HOST_WORKSPACE` / `HOST_FAST_SSD` | 账号 TOML 指定的宿主目录，分别挂到容器 `$HOME/workspace` / `$HOME/md1`。 |
+| `HOST_WORKSPACE` | 账号 TOML 指定的宿主目录，挂到容器 `$HOME/workspace`。 |
 | Docker images | proxy/claude 使用账号专属标签；guard 使用共享只读镜像。 |
 
 `create` 默认把新账号的数据放在独立目录；但手工编写或从旧配置迁移的账号可能共享宿主目录，`validate` 不会阻止这种共享。多个账号同时运行且共享目录时需要自行避免文件竞争。
 
 缓存和临时目录由 TOML 注入：
 
-- `CLAUDE_TMPDIR`、`CLAUDE_XDG_CACHE_HOME`、`CLAUDE_NPM_CONFIG_CACHE`、`CLAUDE_PIP_CACHE_DIR` 默认在 `$HOME/md1` 下；
+- `CLAUDE_TMPDIR`、`CLAUDE_XDG_CACHE_HOME`、`CLAUDE_NPM_CONFIG_CACHE`、`CLAUDE_PIP_CACHE_DIR` 默认在 `$HOME/workspace` 下；启用 `HOST_FAST_SSD` 后也可以改到 `$HOME/md1`；
 - `CLAUDE_UV_CACHE_DIR`、`CLAUDE_UV_PYTHON_INSTALL_DIR`、`CLAUDE_HF_HOME` 默认在 `$HOME/workspace/.cache` 下；
 - Hugging Face 只设置 `HF_HOME`，不单独设置 `HF_HUB_CACHE` / `HF_DATASETS_CACHE`；token 从 `$HF_HOME/token` 读取，不注入 `HF_TOKEN` 环境变量。
 
@@ -238,7 +237,7 @@ name = "claude-docker-<账号>"
 | `DOWNLOAD_PROXY_URI` | 下载分流上游代理；可与 `PROXY_URI` 相同，不能是 direct。 |
 | `PROXY_IMAGE` / `CLAUDE_IMAGE` | 镜像标签；账号模式使用不同标签，不能相同。 |
 | `SINGBOX_VERSION` | sing-box 版本，构建 proxy 镜像时下载对应版本。 |
-| `TZ` / `LOG_LEVEL` | 容器时区和 sing-box 日志级别；模板默认 `America/Los_Angeles` / `warn`。 |
+| `TZ` / `LOG_LEVEL` | 容器时区，默认 `America/Los_Angeles`（美国洛杉矶）；`LOG_LEVEL` 是 sing-box 日志级别，模板默认 `warn`。 |
 | `DOWNLOAD_DOMAIN_SOURCE` | 宿主机下载域名文件，通常为 `./accounts/<账号>.download-domains.txt`。 |
 | `DOWNLOAD_DOMAIN_FILE` | 容器内域名文件路径，默认 `/etc/sing-box/download-domains.txt`；文件必须存在且至少有一个域名。 |
 | `DIRECT_PROXY_LISTEN` / `DIRECT_PROXY_PORT` | 历史命名，实际是内部显式下载代理的监听地址/端口；`DIRECT_PROXY_LISTEN` 必须等于 `PROXY_IP`，端口不映射到宿主机。 |
@@ -255,19 +254,22 @@ name = "claude-docker-<账号>"
 | `EXIT_COUNTRY_DENYLIST` | 可选的两位国家代码 denylist，逗号/空格分隔；空字符串表示不限制。 |
 | `EXIT_COUNTRY_CHECK_URL` | 返回 `loc=<国家代码>` 的 HTTPS 地址；denylist 非空时必须是 HTTPS。 |
 | `EXIT_COUNTRY_CHECK_INTERVAL` | 出口国家复检间隔，10–3600 秒，默认 60。 |
-| `HOST_WORKSPACE` / `HOST_FAST_SSD` | 互不嵌套的绝对路径，分别挂载到容器 `$HOME/workspace` / `$HOME/md1`。 |
+| `EGRESS_DENY_INTERFACES` | 可选。禁止承载代理节点连接的宿主机接口，例如 `utun4` 或 `utun*`。留空表示不检查。 |
+| `HOST_WORKSPACE` | 挂载到容器 `$HOME/workspace` 的绝对路径。 |
 | `CLAUDE_USER` / `CLAUDE_UID` / `CLAUDE_GID` / `CLAUDE_HOME` | 容器用户参数；`CLAUDE_HOME` 必须是 `/home/<CLAUDE_USER>`。 |
 | `CLAUDE_RESOLV_CONF_SOURCE` | Claude 的只读 resolver 文件；内容必须严格匹配该账号 `PROXY_IP`。 |
-| `CLAUDE_EXTRA_APT_PACKAGES` | 构建 claude 镜像时额外安装的 apt 包，空格分隔；修改后需 `up` 重建。不要放内核版本绑定的 `linux-tools-*`。若确实需要系统级 CUDA/nvcc，可在 claude Dockerfile 中换回 CUDA 基础镜像或在此安装对应包。 |
-| `CLAUDE_TMPDIR` / `CLAUDE_XDG_CACHE_HOME` | 临时目录和 XDG 缓存，必须位于 `$HOME/md1` 下。 |
-| `CLAUDE_NPM_CONFIG_CACHE` / `CLAUDE_PIP_CACHE_DIR` | npm / pip 缓存，必须位于 `$HOME/md1` 下。 |
+| `CLAUDE_EXTRA_APT_PACKAGES` | 构建 claude 镜像时额外安装的 apt 包，空格分隔；修改后需 `up` 重建。不要放内核版本绑定的 `linux-tools-*`。默认镜像是 CPU 版 Ubuntu，不包含 CUDA/nvcc。 |
+| `HOST_FAST_SSD` | 可选。非空时必须是与 `HOST_WORKSPACE` 互不嵌套的绝对路径，并挂载到容器 `$HOME/md1`。 |
+| `CLAUDE_TMPDIR` / `CLAUDE_XDG_CACHE_HOME` | 临时目录和 XDG 缓存，必须位于已挂载的 `workspace` 或 `md1` 内。 |
+| `CLAUDE_NPM_CONFIG_CACHE` / `CLAUDE_PIP_CACHE_DIR` | npm / pip 缓存，必须位于已挂载的 `workspace` 或 `md1` 内。 |
 | `CLAUDE_UV_CACHE_DIR` / `CLAUDE_UV_PYTHON_INSTALL_DIR` | uv 缓存与 Python 安装目录，必须位于 `$HOME/workspace` 下。 |
 | `CLAUDE_HF_HOME` | Hugging Face 缓存根目录，必须位于 `$HOME/workspace` 下。 |
 | `CLAUDE_HF_ENDPOINT` | Hugging Face endpoint，模板为 `https://huggingface.co`。 |
 | `CLAUDE_TOKENIZERS_PARALLELISM` | 布尔值，模板默认 `false`。 |
-| `CLAUDE_NVIDIA_VISIBLE_DEVICES` | `all`、`0`、`1` 或 `0,1`；控制可见 GPU，不提供显存配额或调度隔离。 |
 
 `validate` 会检查 TOML 权限、resolver 内容和权限、CIDR/端口、路径范围、镜像标签、代理 URI 形态以及 Docker 网络冲突。账号 TOML 使用标准库 `tomllib` 解析，不依赖 YAML。
+
+`EGRESS_DENY_INTERFACES` 是可选的宿主机出口接口列表，逗号或空格分隔，`*` 只能放在末尾表示前缀。留空表示不检查。`up`、`start`、`restart` 发现代理节点的路由命中该列表时会拒绝启动。
 
 ## 隔离测试栈
 
@@ -289,7 +291,7 @@ uv run scripts/account-env.py test-down default -v
 - 测试 proxy 会只读挂载账号的下载域名文件；可用 `TEST_DOWNLOAD_DOMAIN_SOURCE` / `TEST_DOWNLOAD_DOMAIN_FILE` 临时覆盖。`DOWNLOAD_DOMAIN_FILE` 必须存在且至少包含一个域名。
 - 可以通过 `TEST_PROXY_URI`、`TEST_DOWNLOAD_PROXY_URI`、`TEST_CLAUDE_USER`、`TEST_CLAUDE_UID`、`TEST_CLAUDE_GID`、`TEST_EXIT_COUNTRY_DENYLIST` 等环境变量做当前命令的临时覆盖，不会写回 TOML。CLI 会把测试栈强制设为 proxy-only，并清空测试出口国家 denylist。
 - `test-up` 和 `up` 一样拒绝定向服务与 `--no-start`；`test-down -v` 只删除测试栈的 named volumes，不触碰生产。
-- 测试栈仍需要 GPU；`test-check` 中的 GPU 检查是提示性的。
+- 测试栈和正式栈一样使用 CPU 镜像，不申请 GPU。
 
 建议在修改生产配置或升级镜像前先运行 `test-up` / `test-check`。
 
@@ -298,7 +300,7 @@ uv run scripts/account-env.py test-down default -v
 | 命令 | 作用 |
 | --- | --- |
 | `validate <账号>` | 静态检查，不需要启动容器；检查配置、权限、路径和网络冲突。 |
-| `check <账号>` | 针对运行中的栈检查容器、网络命名空间、防火墙、DNS、代理分流、IPv6、DNS 泄漏、挂载和 GPU；会访问外部测试地址。 |
+| `check <账号>` | 针对运行中的栈检查容器、网络命名空间、防火墙、DNS、代理分流、IPv6、DNS 泄漏和挂载；会访问外部测试地址。 |
 | `net-test <账号>` | 测 DNS、连通性、延迟和下载速度，默认每个目标 5 轮、下载 50MB × 3 轮。 |
 | `fail-closed <账号>` | 临时阻断上游代理，验证客户端断网而非直连回落，然后恢复并确认隧道恢复。需要 `CONFIRM_FAIL_CLOSED_TEST=yes`。 |
 | `repair-network <账号>` | 原地重新应用 network-guard 策略，用于规则漂移。不能修复已被替换的 guard 容器。 |
@@ -313,7 +315,7 @@ DNS_HOST=google.com CONNECT_URLS='https://www.google.com/generate_204 https://hu
 uv run scripts/account-env.py net-test default
 ```
 
-`check` 的 GPU 项失败只显示警告，不改变退出状态；其它项失败会以非零状态退出。
+`check` 失败会以非零状态退出。
 
 ## 排障
 
@@ -324,14 +326,13 @@ uv run scripts/account-env.py net-test default
 - **proxy 一直 unhealthy**：healthcheck 依赖 `api.anthropic.com` 的 HTTPS 和 DNS。先看 `logs <账号> proxy`，再确认上游代理和 `DNS_SERVER` 可达；unhealthy 时网络会保持 fail-closed，这是预期行为。
 - **Claude 无法上网但 proxy 健康**：查看 `ps`、`repair-network` 和 guard 健康状态；若 guard 被替换，执行 `up <账号>`，不要单独重建 guard。
 - **修改代码后没有生效**：`restart` 不会重建镜像；用 `up <账号>`（可加 `--force-recreate`）。改 TOML 后同样用 `up` 应用。
-- **GPU 不可见或检查警告**：确认宿主机驱动、NVIDIA Container Toolkit 和 `docker run --gpus all nvidia-smi`。`CLAUDE_NVIDIA_VISIBLE_DEVICES` 只能筛选可见设备，不能做显存隔离。
 - **Claude Code 需要升级**：可以进入容器执行 `sudo npm install -g @anthropic-ai/claude-code@latest`（会保留到容器重建）；要固化到镜像则重新构建 claude 镜像，构建会拉取当时的版本。
 
 ## 已知边界
 
 - 这不是多租户或多用户安全边界；宿主机 root、Docker daemon 和上游代理被信任。Claude 容器内有免密 sudo，禁用网络 capability 不等于限制所有宿主资源。
 - 网络隔离依赖 Linux 网络命名空间、iptables/nftables 和 sing-box 的行为；不保证对所有内核/发行版组合都成立。
-- GPU 只做可见性筛选，没有 MIG/显存配额。claude 基础镜像不预装系统级 CUDA/cuDNN/nvcc；PyTorch/JAX 等 pip/uv CUDA wheel 自带用户态运行时，但需要系统 CUDA 工具链的扩展要自行安装或改用 `nvidia/cuda:*-devel` 基础镜像。
+- 默认 claude 镜像是 CPU 版 `ubuntu:22.04`，Compose 不申请 GPU，也不预装 CUDA/cuDNN/nvcc。
 - `network-guard` 被重建后必须让 Claude 重新加入新的网络命名空间；CLI 的 `up` 会核对，但宿主机重启或外部 `docker` 操作后建议重新执行一次 `up`。
 - 镜像构建依赖公网：缓存版本仅 `SINGBOX_VERSION` 显式固定，Node.js、uv、Claude Code 等未固定版本；上游下载是否可信取决于构建网络的完整性。
 - 下载域名分流不是访问白名单；`EXIT_COUNTRY_DENYLIST` 是可选的出口观测，不是匿名性保证。

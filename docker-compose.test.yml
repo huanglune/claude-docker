@@ -68,13 +68,12 @@ services:
         CLAUDE_GID: ${TEST_CLAUDE_GID:-${CLAUDE_GID:?CLAUDE_GID is required}}
         CONTAINER_TZ: ${TZ:?TZ is required}
         CLAUDE_EXTRA_APT_PACKAGES: ${TEST_CLAUDE_EXTRA_APT_PACKAGES:-}
-    image: claude-docker-test-nvidia:local
+    image: claude-docker-test-cpu:local
     depends_on:
       proxy:
         condition: service_healthy
       network-guard:
         condition: service_healthy
-    gpus: all
     security_opt:
       - seccomp=unconfined
     cap_drop:
@@ -87,8 +86,6 @@ services:
     network_mode: service:network-guard
     user: ${TEST_CLAUDE_UID:-${CLAUDE_UID:?CLAUDE_UID is required}}:${TEST_CLAUDE_GID:-${CLAUDE_GID:?CLAUDE_GID is required}}
     environment:
-      NVIDIA_VISIBLE_DEVICES: all
-      NVIDIA_DRIVER_CAPABILITIES: compute,utility
       HOME: ${TEST_CLAUDE_HOME:-${CLAUDE_HOME:?CLAUDE_HOME is required}}
       USER: ${TEST_CLAUDE_USER:-${CLAUDE_USER:?CLAUDE_USER is required}}
       LOGNAME: ${TEST_CLAUDE_USER:-${CLAUDE_USER:?CLAUDE_USER is required}}
@@ -119,11 +116,14 @@ services:
   network-guard:
     build:
       context: ./network-guard
+      args:
+        CONTAINER_TZ: ${TZ:?TZ is required}
     image: claude-docker-test-network-guard:local
     depends_on:
       proxy:
         condition: service_healthy
     environment:
+      TZ: ${TZ:?TZ is required}
       PROXY_IP: ${TEST_PROXY_IP:-172.30.20.2}
       LOCKED_SUBNET: ${TEST_LOCKED_SUBNET:-172.30.20.0/24}
       BLOCK_PRIVATE_CIDRS: ${TEST_BLOCK_PRIVATE_CIDRS:-${BLOCK_PRIVATE_CIDRS:?BLOCK_PRIVATE_CIDRS is required}}

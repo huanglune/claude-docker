@@ -23,10 +23,8 @@ fi
 
 env_value() {
   local key="$1"
-  if [[ -v "$key" ]]; then
-    printf '%s\n' "${!key}"
-  fi
-  return 0
+  [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 0
+  printenv "$key" || true
 }
 
 compose_exec() {
@@ -171,7 +169,11 @@ else
   die "resolver mounted read-only" "${resolver_mount:-mount not found}"
 fi
 
-mapfile -t locked_networks < <(
+locked_networks=()
+while IFS= read -r line || [[ -n "$line" ]]; do
+  [[ -n "$line" ]] || continue
+  locked_networks+=("$line")
+done < <(
   docker inspect -f '{{range $name, $_ := .NetworkSettings.Networks}}{{$name}}{{"\n"}}{{end}}' "$guard_container" \
     | awk 'NF'
 )
@@ -183,11 +185,29 @@ else
   die "isolated Docker network" "${locked_networks[0]} $network_policy"
 fi
 
+published_ports=""
+while IFS= read -r container_id || [[ -n "$container_id" ]]; do
+  [[ -n "$container_id" ]] || continue
+  bindings="$(docker inspect -f '{{json .HostConfig.PortBindings}}' "$container_id")"
+  if [[ "$bindings" != "null" && "$bindings" != "{}" && "$bindings" != "map[]" ]]; then
+    published_ports+="$(docker inspect -f '{{.Name}}' "$container_id") ${bindings} "
+  fi
+done < <(docker compose ps -aq)
+if [[ -z "$published_ports" ]]; then
+  ok "no host port publish"
+else
+  die "no host port publish" "$published_ports"
+fi
+
 section "Proxy Gateway"
 run_check "sing-box config is valid" \
   compose_exec proxy sing-box check -c /etc/sing-box/config.json
 
-mapfile -t upstreams < <(compose_exec proxy python3 - <<'PY'
+upstreams=()
+while IFS= read -r line || [[ -n "$line" ]]; do
+  [[ -n "$line" ]] || continue
+  upstreams+=("$line")
+done < <(compose_exec proxy python3 - <<'PY'
 import json
 
 with open("/etc/sing-box/config.json", encoding="utf-8") as fh:
@@ -247,6 +267,8 @@ if not download_suffixes:
 direct_in = inbounds.get("download-proxy-in")
 if not direct_in:
     raise SystemExit("missing download-proxy-in inbound")
+if direct_in.get("listen") in {None, "", "0.0.0.0", "::", "::0"}:
+    raise SystemExit("download proxy listen must be a specific address")
 if not manual_download_rule:
     raise SystemExit("missing download-proxy-in route")
 if config["route"].get("final") != "proxy":
@@ -398,7 +420,11 @@ fi
 
 resolv_conf="$(compose_exec claude bash -lc 'cat /etc/resolv.conf' 2>&1)" \
   || die "DNS search domain hidden" "$resolv_conf"
-mapfile -t resolver_nameservers < <(awk '$1 == "nameserver" { print $2 }' <<<"$resolv_conf")
+resolver_nameservers=()
+while IFS= read -r line || [[ -n "$line" ]]; do
+  [[ -n "$line" ]] || continue
+  resolver_nameservers+=("$line")
+done < <(awk '$1 == "nameserver" { print $2 }' <<<"$resolv_conf")
 if [[ "${#resolver_nameservers[@]}" -ne 1 || "${resolver_nameservers[0]:-}" != "$PROXY_IP" ]]; then
   die "DNS resolver pinned to proxy" "$resolv_conf"
 fi
@@ -537,14 +563,23 @@ user_line="$(compose_exec claude bash -lc '
 
 mounts_line="$(compose_exec claude bash -lc '
   set -euo pipefail
-  for dir in "$HOME/workspace" "$HOME/md1" "$HOME/md1/tmp" "$HOME/md1/cache"; do
+  fast_ssd="$1"
+  dirs=("$HOME/workspace" "$TMPDIR" "$XDG_CACHE_HOME")
+  if [ -n "$fast_ssd" ]; then
+    dirs+=("$HOME/md1")
+  fi
+  for dir in "${dirs[@]}"; do
     [ -d "$dir" ] || { echo "missing: $dir"; exit 1; }
   done
   workspace_test="$(mktemp "$HOME/workspace/.claude-docker-check.XXXXXX")"
-  md1_test="$(mktemp "$HOME/md1/tmp/.claude-docker-check.XXXXXX")"
-  rm -f "$workspace_test" "$md1_test"
-  printf "%s and %s writable" "$HOME/workspace" "$HOME/md1"
-' 2>&1)" \
+  cache_test="$(mktemp "$TMPDIR/.claude-docker-check.XXXXXX")"
+  rm -f "$workspace_test" "$cache_test"
+  if [ -n "$fast_ssd" ]; then
+    printf "%s and %s writable" "$HOME/workspace" "$HOME/md1"
+  else
+    printf "%s writable" "$HOME/workspace"
+  fi
+' bash "${HOST_FAST_SSD:-}" 2>&1)" \
   && ok "data mounts writable" "$mounts_line" \
   || die "data mounts writable" "$mounts_line"
 
@@ -575,10 +610,5 @@ if [[ "$hf_token_state" == "present" ]]; then
 else
   warn "HF token file" "not found"
 fi
-
-section "GPU"
-gpu_output="$(compose_exec claude bash -lc 'nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader' 2>&1)" \
-  && ok "NVIDIA GPU visible" "$(printf '%s\n' "$gpu_output" | awk 'NR > 1 { printf "; " } { printf "%s", $0 }')" \
-  || warn "NVIDIA GPU visible" "$gpu_output"
 
 printf '\n%s✓ All checks passed%s\n' "$green" "$reset"

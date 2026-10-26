@@ -7,7 +7,7 @@ name = "claude-docker-example"
 [environment]
 # 隔离镜像标签
 PROXY_IMAGE = "claude-docker-example-proxy:local"
-CLAUDE_IMAGE = "claude-docker-example-nvidia:local"
+CLAUDE_IMAGE = "claude-docker-example-cpu:local"
 
 # 每个账号自己的代理配置。proxy-only 模式要求服务器部分为 IPv4，TLS SNI 可保留域名。
 # 只有一条代理时，DOWNLOAD_PROXY_URI 可以与 PROXY_URI 完全相同。
@@ -21,11 +21,14 @@ TUN_MTU = "9000"
 LOG_LEVEL = "warn"
 DNS_HIJACK = "false"
 SINGBOX_VERSION = "1.11.4"
+# 容器时区，默认美国洛杉矶。
 TZ = "America/Los_Angeles"
 
 # 宿主目录必须按账号分开；首次 up 时管理脚本会自动创建。
+# 默认只挂载 workspace。需要第二块盘时把 HOST_FAST_SSD 设成与 workspace 互不嵌套的绝对路径，
+# 它会额外挂到容器 $HOME/md1，缓存路径也可以改到那里。
 HOST_WORKSPACE = "/srv/claude-docker/example/workspace"
-HOST_FAST_SSD = "/srv/claude-docker/example/md1"
+HOST_FAST_SSD = ""
 
 # 容器用户通常与宿主用户保持一致。
 CLAUDE_USER = "claude"
@@ -35,18 +38,16 @@ CLAUDE_HOME = "/home/claude"
 CLAUDE_RESOLV_CONF_SOURCE = "./accounts/example.resolv.conf"
 CLAUDE_EXTRA_APT_PACKAGES = "vim btop htop cmake build-essential libaio-dev gh libevent-dev libncurses-dev bison pkg-config fio iotop rsync gdb hwloc valgrind"
 
-# 容器内缓存路径；最终分别落在本账号的 workspace/md1 绑定目录。
-CLAUDE_TMPDIR = "/home/claude/md1/tmp"
-CLAUDE_XDG_CACHE_HOME = "/home/claude/md1/cache"
-CLAUDE_NPM_CONFIG_CACHE = "/home/claude/md1/cache/npm"
-CLAUDE_PIP_CACHE_DIR = "/home/claude/md1/cache/pip"
+# 容器内缓存路径。默认都在 workspace 挂载里；启用 HOST_FAST_SSD 后也可以改到 $HOME/md1。
+CLAUDE_TMPDIR = "/home/claude/workspace/tmp"
+CLAUDE_XDG_CACHE_HOME = "/home/claude/workspace/.cache"
+CLAUDE_NPM_CONFIG_CACHE = "/home/claude/workspace/.cache/npm"
+CLAUDE_PIP_CACHE_DIR = "/home/claude/workspace/.cache/pip"
 CLAUDE_UV_CACHE_DIR = "/home/claude/workspace/.cache/uv"
 CLAUDE_UV_PYTHON_INSTALL_DIR = "/home/claude/workspace/.cache/uv/python"
 CLAUDE_HF_HOME = "/home/claude/workspace/.cache/huggingface"
 CLAUDE_HF_ENDPOINT = "https://huggingface.co"
 CLAUDE_TOKENIZERS_PARALLELISM = "false"
-# 可填 all、0、1 或 0,1。Docker 层仍请求 GPU，容器内只显示这里指定的设备。
-CLAUDE_NVIDIA_VISIBLE_DEVICES = "all"
 
 # 同一宿主机上的每个账号必须使用不同 /24 子网。
 LOCKED_SUBNET = "172.30.99.0/24"
@@ -65,3 +66,5 @@ PROXY_ONLY = "true"
 EXIT_COUNTRY_DENYLIST = ""
 EXIT_COUNTRY_CHECK_URL = "https://www.cloudflare.com/cdn-cgi/trace"
 EXIT_COUNTRY_CHECK_INTERVAL = "60"
+# 可选。代理节点的宿主机路由命中这些接口时拒绝启动。逗号或空格分隔，* 只可作为前缀结尾。
+EGRESS_DENY_INTERFACES = ""

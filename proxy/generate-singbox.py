@@ -92,6 +92,9 @@ class RuntimeConfig:
                 raise ValueError(f"PRIVATE_TCP_ALLOWLIST would create public direct egress: {target.cidr}")
             if not any(network.subnet_of(blocked) for blocked in private_networks):
                 raise ValueError(f"PRIVATE_TCP_ALLOWLIST is outside BLOCK_PRIVATE_CIDRS: {target.cidr}")
+        listen_ip = ipaddress.ip_address(require_env("DIRECT_PROXY_LISTEN"))
+        if listen_ip.version != 4 or listen_ip.is_unspecified:
+            raise ValueError("DIRECT_PROXY_LISTEN must be a specific IPv4 address, not 0.0.0.0")
         return cls(
             tun_address=require_env("TUN_ADDRESS"),
             tun_mtu=int(require_env("TUN_MTU")),
@@ -101,7 +104,7 @@ class RuntimeConfig:
             private_cidrs=private_cidrs,
             route_exclude_cidrs=route_excludes,
             download_domain_suffixes=load_download_domain_suffixes(),
-            direct_proxy_listen=require_env("DIRECT_PROXY_LISTEN"),
+            direct_proxy_listen=str(listen_ip),
             direct_proxy_port=int(require_env("DIRECT_PROXY_PORT")),
             private_tcp_allowlist=private_tcp_allowlist,
             locked_subnet=locked_subnet,

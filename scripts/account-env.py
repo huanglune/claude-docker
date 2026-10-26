@@ -24,6 +24,7 @@ from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parent.parent
 BASE_COMPOSE = ROOT / "docker-compose.yml"
+FAST_SSD_COMPOSE = ROOT / "docker-compose.fast-ssd.yml"
 TEST_COMPOSE = ROOT / "docker-compose.test.yml"
 ACCOUNTS_DIR = ROOT / "accounts"
 TEMPLATE = ACCOUNTS_DIR / "example.toml"
@@ -74,7 +75,6 @@ ENV_KEYS = {
     "CLAUDE_HF_HOME",
     "CLAUDE_HF_ENDPOINT",
     "CLAUDE_TOKENIZERS_PARALLELISM",
-    "CLAUDE_NVIDIA_VISIBLE_DEVICES",
     "LOCKED_SUBNET",
     "PROXY_IP",
     "CLAUDE_IP",
@@ -87,12 +87,15 @@ ENV_KEYS = {
     "EXIT_COUNTRY_DENYLIST",
     "EXIT_COUNTRY_CHECK_URL",
     "EXIT_COUNTRY_CHECK_INTERVAL",
+    "EGRESS_DENY_INTERFACES",
 }
 
 EMPTY_ALLOWED = {
     "CLAUDE_EXTRA_APT_PACKAGES",
+    "HOST_FAST_SSD",
     "PRIVATE_TCP_ALLOWLIST",
     "EXIT_COUNTRY_DENYLIST",
+    "EGRESS_DENY_INTERFACES",
 }
 
 ABSOLUTE_CONTAINER_PATH_KEYS = {
@@ -124,7 +127,7 @@ class AccountConfig:
         env = os.environ.copy()
         env.update(self.environment)
         env["COMPOSE_PROJECT_NAME"] = self.project
-        env["COMPOSE_FILE"] = str(BASE_COMPOSE)
+        env["COMPOSE_FILE"] = os.pathsep.join(str(path) for path in compose_files(self.environment))
         env["COMPOSE_DISABLE_ENV_FILE"] = "1"
         env["CLAUDE_CONFIG_SOURCE"] = f"toml:{self.account}"
         return env
@@ -163,6 +166,87 @@ def run_foreground(command: list[str], *, env: dict[str, str]) -> None:
         raise ConfigError(f"找不到命令: {command[0]}") from exc
     if result.returncode != 0:
         raise ConfigError(f"命令执行失败（exit={result.returncode}）: {' '.join(command)}")
+
+
+def egress_deny_patterns(value: str) -> list[str]:
+    patterns: list[str] = []
+    for item in value.replace(",", " ").split():
+        if (
+            not re.fullmatch(r"[A-Za-z0-9_.:*-]+", item)
+            or item.count("*") > 1
+            or ("*" in item and not item.endswith("*"))
+        ):
+            raise ConfigError(
+                "EGRESS_DENY_INTERFACES 只接受接口名，或以后缀 * 表示的前缀: "
+                f"{item}"
+            )
+        patterns.append(item)
+    return patterns
+
+
+def interface_is_denied(interface: str, patterns: list[str]) -> bool:
+    for pattern in patterns:
+        if pattern.endswith("*"):
+            if interface.startswith(pattern[:-1]):
+                return True
+        elif interface == pattern:
+            return True
+    return False
+
+
+def host_route_interface(host: str) -> str:
+    if sys.platform == "darwin":
+        result = run_capture(["route", "-n", "get", host])
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip() or f"exit={result.returncode}"
+            raise ConfigError(f"无法查询主机路由 {host}: {detail}")
+        for line in result.stdout.splitlines():
+            field, separator, value = line.strip().partition(":")
+            if separator and field == "interface":
+                parsed = value.strip().split()
+                if parsed:
+                    return parsed[0]
+        raise ConfigError(f"主机路由 {host} 没有接口")
+    result = run_capture(["ip", "-4", "route", "get", host])
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or f"exit={result.returncode}"
+        raise ConfigError(f"无法查询主机路由 {host}: {detail}")
+    parts = result.stdout.split()
+    for index, token in enumerate(parts):
+        if token == "dev" and index + 1 < len(parts):
+            return parts[index + 1]
+    raise ConfigError(f"主机路由 {host} 没有接口")
+
+
+def assert_egress_ignore(environment: dict[str, str], *, test: bool = False) -> None:
+    patterns = egress_deny_patterns(environment.get("EGRESS_DENY_INTERFACES", ""))
+    if not patterns:
+        return
+    if test:
+        endpoints = (
+            ("PROXY_URI", environment.get("TEST_PROXY_URI") or environment.get("PROXY_URI", "")),
+            (
+                "DOWNLOAD_PROXY_URI",
+                environment.get("TEST_DOWNLOAD_PROXY_URI") or environment.get("DOWNLOAD_PROXY_URI", ""),
+            ),
+        )
+    else:
+        endpoints = (
+            ("PROXY_URI", environment.get("PROXY_URI", "")),
+            ("DOWNLOAD_PROXY_URI", environment.get("DOWNLOAD_PROXY_URI", "")),
+        )
+    seen: set[str] = set()
+    for key, uri in endpoints:
+        host = urlsplit(uri).hostname or ""
+        if not host or host in seen:
+            continue
+        seen.add(host)
+        interface = host_route_interface(host)
+        if interface_is_denied(interface, patterns):
+            raise ConfigError(
+                f"{key} ({host}) 的主机路由经由 {interface}，"
+                "命中 EGRESS_DENY_INTERFACES，已拒绝启动"
+            )
 
 
 def scalar_to_string(key: str, value: object) -> str:
@@ -348,19 +432,18 @@ def validate_environment(account: str, project: str, environment: dict[str, str]
     if denied_countries and not environment["EXIT_COUNTRY_CHECK_URL"].startswith("https://"):
         raise ConfigError("EXIT_COUNTRY_CHECK_URL 必须使用 https://")
     parse_positive_int(environment, "EXIT_COUNTRY_CHECK_INTERVAL", 10, 3600)
+    egress_deny_patterns(environment["EGRESS_DENY_INTERFACES"])
 
-    for key in ("HOST_WORKSPACE", "HOST_FAST_SSD"):
-        path = Path(environment[key])
-        if not path.is_absolute() or path == Path("/") or ".." in path.parts:
-            raise ConfigError(f"{key} 必须是非根目录的绝对路径")
-    host_workspace = Path(environment["HOST_WORKSPACE"])
-    host_fast_ssd = Path(environment["HOST_FAST_SSD"])
-    if (
-        host_workspace == host_fast_ssd
-        or host_workspace in host_fast_ssd.parents
-        or host_fast_ssd in host_workspace.parents
-    ):
-        raise ConfigError("HOST_WORKSPACE 与 HOST_FAST_SSD 必须是互不嵌套的不同目录")
+    host_workspace = require_host_directory("HOST_WORKSPACE", environment["HOST_WORKSPACE"])
+    host_fast_ssd = environment["HOST_FAST_SSD"].strip()
+    if host_fast_ssd:
+        fast_ssd_path = require_host_directory("HOST_FAST_SSD", host_fast_ssd)
+        if (
+            host_workspace == fast_ssd_path
+            or host_workspace in fast_ssd_path.parents
+            or fast_ssd_path in host_workspace.parents
+        ):
+            raise ConfigError("HOST_WORKSPACE 与 HOST_FAST_SSD 必须是互不嵌套的不同目录")
 
     for key in ABSOLUTE_CONTAINER_PATH_KEYS:
         path = Path(environment[key])
@@ -373,20 +456,29 @@ def validate_environment(account: str, project: str, environment: dict[str, str]
         raise ConfigError(f"CLAUDE_HOME 必须是 {expected_home}，以匹配 Dockerfile 创建的用户目录")
 
     container_workspace = home / "workspace"
-    container_fast_ssd = home / "md1"
-    expected_roots = {
-        "CLAUDE_TMPDIR": container_fast_ssd,
-        "CLAUDE_XDG_CACHE_HOME": container_fast_ssd,
-        "CLAUDE_NPM_CONFIG_CACHE": container_fast_ssd,
-        "CLAUDE_PIP_CACHE_DIR": container_fast_ssd,
-        "CLAUDE_UV_CACHE_DIR": container_workspace,
-        "CLAUDE_UV_PYTHON_INSTALL_DIR": container_workspace,
-        "CLAUDE_HF_HOME": container_workspace,
-    }
-    for key, root in expected_roots.items():
+    flexible_roots = [container_workspace]
+    if host_fast_ssd:
+        flexible_roots.append(home / "md1")
+    flexible_keys = (
+        "CLAUDE_TMPDIR",
+        "CLAUDE_XDG_CACHE_HOME",
+        "CLAUDE_NPM_CONFIG_CACHE",
+        "CLAUDE_PIP_CACHE_DIR",
+    )
+    workspace_keys = (
+        "CLAUDE_UV_CACHE_DIR",
+        "CLAUDE_UV_PYTHON_INSTALL_DIR",
+        "CLAUDE_HF_HOME",
+    )
+    for key in flexible_keys:
         path = Path(environment[key])
-        if path != root and root not in path.parents:
-            raise ConfigError(f"{key} 必须位于账号挂载点 {root} 内")
+        if not any(path == root or root in path.parents for root in flexible_roots):
+            allowed = "$HOME/workspace" if not host_fast_ssd else "$HOME/workspace 或 $HOME/md1"
+            raise ConfigError(f"{key} 必须位于已挂载的目录内: {allowed}")
+    for key in workspace_keys:
+        path = Path(environment[key])
+        if path != container_workspace and container_workspace not in path.parents:
+            raise ConfigError(f"{key} 必须位于 $HOME/workspace 内")
 
     source = resolve_source_path(environment["DOWNLOAD_DOMAIN_SOURCE"])
     if not source.is_file():
@@ -428,6 +520,8 @@ def validate_environment(account: str, project: str, environment: dict[str, str]
         raise ConfigError("PROXY_IP 和 CLAUDE_IP 不能使用网络地址或广播地址")
     if proxy_ip == claude_ip:
         raise ConfigError("PROXY_IP 与 CLAUDE_IP 不能相同")
+    if any(addr.is_unspecified for addr in (proxy_ip, claude_ip, direct_listen)):
+        raise ConfigError("PROXY_IP、CLAUDE_IP、DIRECT_PROXY_LISTEN 必须是具体地址，不能使用 0.0.0.0")
     if direct_listen != proxy_ip:
         raise ConfigError("DIRECT_PROXY_LISTEN 必须与 PROXY_IP 相同")
     validate_resolver_file(environment["CLAUDE_RESOLV_CONF_SOURCE"], proxy_ip)
@@ -526,8 +620,22 @@ def assert_no_network_conflict(config: AccountConfig) -> None:
         )
 
 
+def require_host_directory(key: str, value: str) -> Path:
+    path = Path(value)
+    if not path.is_absolute() or path == Path("/") or ".." in path.parts:
+        raise ConfigError(f"{key} 必须是非根目录的绝对路径")
+    return path
+
+
+def compose_files(environment: dict[str, str]) -> list[Path]:
+    files = [BASE_COMPOSE]
+    if environment.get("HOST_FAST_SSD", "").strip():
+        files.append(FAST_SSD_COMPOSE)
+    return files
+
+
 def compose_prefix(config: AccountConfig) -> list[str]:
-    return [
+    command = [
         "docker",
         "compose",
         "--env-file",
@@ -536,9 +644,10 @@ def compose_prefix(config: AccountConfig) -> list[str]:
         str(ROOT),
         "-p",
         config.project,
-        "-f",
-        str(BASE_COMPOSE),
     ]
+    for path in compose_files(config.environment):
+        command.extend(["-f", str(path)])
+    return command
 
 
 def test_project_name(config: AccountConfig) -> str:
@@ -663,11 +772,31 @@ def ensure_network_guard_topology(
     print(f"网络命名空间就绪: network-guard={guard[:12]} {guard_netns}")
 
 
+def assert_no_published_ports(path: Path) -> None:
+    for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        stripped = line.split("#", 1)[0].strip()
+        if stripped == "ports:" or stripped.startswith("ports:"):
+            raise ConfigError(f"{path.name}:{lineno} 禁止把容器端口发布到宿主机")
+
+
 def validate_compose(config: AccountConfig) -> None:
-    result = run_capture(compose_prefix(config) + ["config", "-q"], env=config.process_environment())
+    assert_no_published_ports(BASE_COMPOSE)
+    assert_no_published_ports(FAST_SSD_COMPOSE)
+    assert_no_published_ports(TEST_COMPOSE)
+    result = run_capture(
+        compose_prefix(config) + ["config", "--format", "json"],
+        env=config.process_environment(),
+    )
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip() or "Docker Compose 无输出"
         raise ConfigError(f"公共 Compose 与账号配置合并失败: {detail}")
+    try:
+        rendered = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise ConfigError(f"无法解析 Compose 配置: {exc}") from exc
+    for name, service in rendered.get("services", {}).items():
+        if service.get("ports"):
+            raise ConfigError(f"服务 {name} 不能把端口发布到宿主机，避免监听 0.0.0.0")
 
 
 def configured_subnets_from_files() -> list[ipaddress._BaseNetwork]:
@@ -785,11 +914,8 @@ def create_account(account: str) -> None:
     if not re.fullmatch(r"[a-z_][a-z0-9_-]*", user):
         raise ConfigError(f"宿主用户名不适合作为容器用户名: {user}")
     container_home = Path("/home") / user
-    workspace_root = host_home / "workspace"
-    fast_ssd_root = host_home / "md1"
-    host_workspace = workspace_root / "claude-accounts" / account
-    host_fast_ssd = fast_ssd_root / "claude-accounts" / account
-    existing_paths = [path for path in (host_workspace, host_fast_ssd) if path.exists()]
+    host_workspace = host_home / "workspace" / "claude-accounts" / account
+    existing_paths = [host_workspace] if host_workspace.exists() else []
     if existing_paths:
         raise ConfigError(
             "拒绝复用已有账号存储目录: "
@@ -819,19 +945,19 @@ def create_account(account: str) -> None:
 
     updates: dict[str, str | int] = {
         "PROXY_IMAGE": f"claude-docker-{account}-proxy:local",
-        "CLAUDE_IMAGE": f"claude-docker-{account}-nvidia:local",
+        "CLAUDE_IMAGE": f"claude-docker-{account}-cpu:local",
         "DOWNLOAD_DOMAIN_SOURCE": f"./accounts/{account}.download-domains.txt",
         "HOST_WORKSPACE": str(host_workspace),
-        "HOST_FAST_SSD": str(host_fast_ssd),
+        "HOST_FAST_SSD": "",
         "CLAUDE_USER": user,
         "CLAUDE_UID": uid,
         "CLAUDE_GID": gid,
         "CLAUDE_HOME": str(container_home),
         "CLAUDE_RESOLV_CONF_SOURCE": f"./accounts/{account}.resolv.conf",
-        "CLAUDE_TMPDIR": str(container_home / "md1" / "tmp"),
-        "CLAUDE_XDG_CACHE_HOME": str(container_home / "md1" / "cache"),
-        "CLAUDE_NPM_CONFIG_CACHE": str(container_home / "md1" / "cache" / "npm"),
-        "CLAUDE_PIP_CACHE_DIR": str(container_home / "md1" / "cache" / "pip"),
+        "CLAUDE_TMPDIR": str(container_home / "workspace" / "tmp"),
+        "CLAUDE_XDG_CACHE_HOME": str(container_home / "workspace" / ".cache"),
+        "CLAUDE_NPM_CONFIG_CACHE": str(container_home / "workspace" / ".cache" / "npm"),
+        "CLAUDE_PIP_CACHE_DIR": str(container_home / "workspace" / ".cache" / "pip"),
         "CLAUDE_UV_CACHE_DIR": str(container_home / "workspace" / ".cache" / "uv"),
         "CLAUDE_UV_PYTHON_INSTALL_DIR": str(container_home / "workspace" / ".cache" / "uv" / "python"),
         "CLAUDE_HF_HOME": str(container_home / "workspace" / ".cache" / "huggingface"),
@@ -889,15 +1015,12 @@ def prepare_directories(config: AccountConfig) -> None:
     gid = int(config.environment["CLAUDE_GID"])
     home = Path(config.environment["CLAUDE_HOME"])
     host_workspace = Path(config.environment["HOST_WORKSPACE"])
-    host_fast_ssd = Path(config.environment["HOST_FAST_SSD"])
-    mounts = {
-        home / "workspace": host_workspace,
-        home / "md1": host_fast_ssd,
-    }
-    directories: dict[str, Path] = {
-        "HOST_WORKSPACE": host_workspace,
-        "HOST_FAST_SSD": host_fast_ssd,
-    }
+    host_fast_ssd = config.environment["HOST_FAST_SSD"].strip()
+    mounts = {home / "workspace": host_workspace}
+    directories: dict[str, Path] = {"HOST_WORKSPACE": host_workspace}
+    if host_fast_ssd:
+        mounts[home / "md1"] = Path(host_fast_ssd)
+        directories["HOST_FAST_SSD"] = Path(host_fast_ssd)
     for key in (
         "CLAUDE_TMPDIR",
         "CLAUDE_XDG_CACHE_HOME",
@@ -908,10 +1031,14 @@ def prepare_directories(config: AccountConfig) -> None:
         "CLAUDE_HF_HOME",
     ):
         container_path = Path(config.environment[key])
+        matched = False
         for container_root, host_root in mounts.items():
             if container_path == container_root or container_root in container_path.parents:
                 directories[key] = host_root / container_path.relative_to(container_root)
+                matched = True
                 break
+        if not matched:
+            raise ConfigError(f"{key} 没有对应的宿主机挂载")
 
     for key, path in directories.items():
         path.mkdir(parents=True, exist_ok=True)
@@ -939,7 +1066,8 @@ def print_validation(config: AccountConfig) -> None:
         f"{environment['DIRECT_PROXY_LISTEN']}:{environment['DIRECT_PROXY_PORT']}"
     )
     print(f"workspace: {environment['HOST_WORKSPACE']}")
-    print(f"fast SSD: {environment['HOST_FAST_SSD']}")
+    if environment["HOST_FAST_SSD"].strip():
+        print(f"fast SSD: {environment['HOST_FAST_SSD']}")
 
 
 def exec_command(command: list[str], environment: dict[str, str]) -> NoReturn:
@@ -1019,6 +1147,7 @@ def main(argv: list[str]) -> int:
                 )
             if "--no-start" in extra:
                 raise ConfigError("test-up 不支持 --no-start")
+            assert_egress_ignore(test_environment, test=True)
             build_option = [] if "--no-build" in extra else ["--build"]
             run_foreground(
                 test_compose + ["up", "-d", *build_option, *extra],
@@ -1048,6 +1177,7 @@ def main(argv: list[str]) -> int:
             exec_command([str(ROOT / "scripts" / "fail-closed-test.sh")], test_environment)
     if action == "up":
         assert_no_network_conflict(config)
+        assert_egress_ignore(environment)
         prepare_directories(config)
         service_targets = {"proxy", "network-guard", "claude"}.intersection(extra)
         if service_targets:
@@ -1076,6 +1206,7 @@ def main(argv: list[str]) -> int:
     if action == "net-test":
         exec_command([str(ROOT / "scripts" / "net-test.sh"), *extra], environment)
     if action in {"start", "restart"}:
+        assert_egress_ignore(environment)
         service_targets = {"proxy", "network-guard", "claude"}.intersection(extra)
         run_foreground(compose + [action, *extra], env=environment)
         if not service_targets or service_targets.intersection({"network-guard", "claude"}):
