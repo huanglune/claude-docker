@@ -1,6 +1,4 @@
-# Claude Code does not need a CUDA userland. The NVIDIA Container Toolkit
-# injects the driver libraries and nvidia-smi into this generic Ubuntu image
-# at container start (see gpus/all and NVIDIA_DRIVER_CAPABILITIES in compose).
+# CPU image. Claude Code runs on generic Ubuntu and does not request a GPU.
 ARG BASE_IMAGE=ubuntu:22.04
 FROM ${BASE_IMAGE}
 
@@ -48,10 +46,40 @@ RUN set -eux; \
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends zsh; \
-    rm -rf /var/lib/apt/lists/*
+    rm -rf /var/lib/apt/lists/*; \
+    git clone --depth=1 https://github.com/ohmyzsh/ohmyzsh.git /usr/local/share/oh-my-zsh; \
+    git clone --depth=1 https://github.com/romkatv/powerlevel10k.git \
+      /usr/local/share/oh-my-zsh/custom/themes/powerlevel10k; \
+    git clone --depth=1 https://github.com/zsh-users/zsh-autosuggestions.git \
+      /usr/local/share/oh-my-zsh/custom/plugins/zsh-autosuggestions; \
+    git clone --depth=1 https://github.com/zsh-users/zsh-syntax-highlighting.git \
+      /usr/local/share/oh-my-zsh/custom/plugins/zsh-syntax-highlighting; \
+    GITSTATUS_CACHE_DIR=/usr/local/share/oh-my-zsh/custom/themes/powerlevel10k/gitstatus/usrbin \
+      /usr/local/share/oh-my-zsh/custom/themes/powerlevel10k/gitstatus/install; \
+    chmod -R a+rX /usr/local/share/oh-my-zsh
 
+COPY zshrc /etc/skel/.zshrc
+COPY zshenv.snippet /usr/local/share/claude-docker/zshenv.snippet
+RUN cat /usr/local/share/claude-docker/zshenv.snippet >> /etc/zsh/zshenv
+
+# macOS staff is gid 20, which Ubuntu already uses for dialout.
 RUN set -eux; \
-    groupadd --gid "${CLAUDE_GID}" "${CLAUDE_USER}"; \
+    if getent group "${CLAUDE_GID}" >/dev/null; then \
+      echo "gid ${CLAUDE_GID} already exists; reusing it for ${CLAUDE_USER}"; \
+    elif getent group "${CLAUDE_USER}" >/dev/null; then \
+      echo "group name ${CLAUDE_USER} exists with a different gid" >&2; \
+      exit 1; \
+    else \
+      groupadd --gid "${CLAUDE_GID}" "${CLAUDE_USER}"; \
+    fi; \
+    if getent passwd "${CLAUDE_UID}" >/dev/null; then \
+      echo "uid ${CLAUDE_UID} already exists" >&2; \
+      exit 1; \
+    fi; \
+    if getent passwd "${CLAUDE_USER}" >/dev/null; then \
+      echo "user ${CLAUDE_USER} already exists" >&2; \
+      exit 1; \
+    fi; \
     useradd --uid "${CLAUDE_UID}" --gid "${CLAUDE_GID}" \
       --create-home --shell /usr/bin/zsh "${CLAUDE_USER}"; \
     printf '%s ALL=(ALL) NOPASSWD:ALL\n' "${CLAUDE_USER}" > /etc/sudoers.d/claude-user; \
@@ -66,8 +94,7 @@ ENV LANG=en_US.UTF-8 \
     HOME="/home/${CLAUDE_USER}" \
     USER="${CLAUDE_USER}" \
     LOGNAME="${CLAUDE_USER}" \
-    PATH="/home/${CLAUDE_USER}/.local/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/bin:${PATH}" \
-    LD_LIBRARY_PATH="/usr/local/nvidia/lib:/usr/local/nvidia/lib64"
+    PATH="/home/${CLAUDE_USER}/.local/bin:/usr/local/bin:${PATH}"
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["sleep", "infinity"]

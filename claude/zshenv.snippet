@@ -1,0 +1,4 @@
+# Give a new home the image zshrc before zsh-newuser-install runs.
+if [[ -o interactive && ! -e ${ZDOTDIR:-$HOME}/.zshrc && -r /etc/skel/.zshrc ]]; then
+  cp /etc/skel/.zshrc ${ZDOTDIR:-$HOME}/.zshrc
+fi

@@ -68,13 +68,12 @@ services:
         CLAUDE_GID: ${CLAUDE_GID:?CLAUDE_GID is required}
         CONTAINER_TZ: ${TZ:?TZ is required}
         CLAUDE_EXTRA_APT_PACKAGES: ${CLAUDE_EXTRA_APT_PACKAGES:-}
-    image: ${CLAUDE_IMAGE:-claude-docker-nvidia:local}
+    image: ${CLAUDE_IMAGE:-claude-docker-cpu:local}
     depends_on:
       proxy:
         condition: service_healthy
       network-guard:
         condition: service_healthy
-    gpus: all
     security_opt:
       - seccomp=unconfined
     cap_drop:
@@ -87,8 +86,6 @@ services:
     network_mode: service:network-guard
     user: ${CLAUDE_UID:?CLAUDE_UID is required}:${CLAUDE_GID:?CLAUDE_GID is required}
     environment:
-      NVIDIA_VISIBLE_DEVICES: ${CLAUDE_NVIDIA_VISIBLE_DEVICES:-all}
-      NVIDIA_DRIVER_CAPABILITIES: compute,utility
       HOME: ${CLAUDE_HOME:?CLAUDE_HOME is required}
       USER: ${CLAUDE_USER:?CLAUDE_USER is required}
       LOGNAME: ${CLAUDE_USER:?CLAUDE_USER is required}
@@ -111,9 +108,6 @@ services:
       - type: bind
         source: ${HOST_WORKSPACE:?HOST_WORKSPACE is required}
         target: ${CLAUDE_HOME:?CLAUDE_HOME is required}/workspace
-      - type: bind
-        source: ${HOST_FAST_SSD:?HOST_FAST_SSD is required}
-        target: ${CLAUDE_HOME:?CLAUDE_HOME is required}/md1
     working_dir: ${CLAUDE_HOME:?CLAUDE_HOME is required}/workspace
     stdin_open: true
     tty: true
@@ -123,11 +117,14 @@ services:
   network-guard:
     build:
       context: ./network-guard
+      args:
+        CONTAINER_TZ: ${TZ:?TZ is required}
     image: claude-docker-network-guard:local
     depends_on:
       proxy:
         condition: service_healthy
     environment:
+      TZ: ${TZ:?TZ is required}
       PROXY_IP: ${PROXY_IP:?PROXY_IP is required}
       LOCKED_SUBNET: ${LOCKED_SUBNET:?LOCKED_SUBNET is required}
       BLOCK_PRIVATE_CIDRS: ${BLOCK_PRIVATE_CIDRS:?BLOCK_PRIVATE_CIDRS is required}

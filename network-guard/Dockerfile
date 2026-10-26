@@ -1,12 +1,18 @@
 FROM debian:bookworm-slim
 
-ENV DEBIAN_FRONTEND=noninteractive
+ARG CONTAINER_TZ=America/Los_Angeles
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    TZ="${CONTAINER_TZ}"
 
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
-      bash iproute2 iptables procps util-linux; \
-    rm -rf /var/lib/apt/lists/*
+      bash iproute2 iptables procps tzdata util-linux; \
+    rm -rf /var/lib/apt/lists/*; \
+    test -f "/usr/share/zoneinfo/${CONTAINER_TZ}"; \
+    ln -snf "/usr/share/zoneinfo/${CONTAINER_TZ}" /etc/localtime; \
+    echo "${CONTAINER_TZ}" > /etc/timezone
 
 COPY network-guard.sh /usr/local/bin/network-guard.sh
 RUN chmod 0555 /usr/local/bin/network-guard.sh
