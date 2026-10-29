@@ -8,6 +8,8 @@ ARG CLAUDE_GID=1000
 ARG CONTAINER_TZ=America/Los_Angeles
 
 ENV DEBIAN_FRONTEND=noninteractive
+RUN cp -a /etc/apt/sources.list /etc/apt/sources.list.orig && \
+    sed -i 's|archive.ubuntu.com|mirrors.aliyun.com|g; s|security.ubuntu.com|mirrors.aliyun.com|g' /etc/apt/sources.list
 ARG CLAUDE_EXTRA_APT_PACKAGES=""
 
 RUN set -eux; \
@@ -57,6 +59,8 @@ RUN set -eux; \
     GITSTATUS_CACHE_DIR=/usr/local/share/oh-my-zsh/custom/themes/powerlevel10k/gitstatus/usrbin \
       /usr/local/share/oh-my-zsh/custom/themes/powerlevel10k/gitstatus/install; \
     chmod -R a+rX /usr/local/share/oh-my-zsh
+
+RUN mv -f /etc/apt/sources.list.orig /etc/apt/sources.list
 
 COPY zshrc /etc/skel/.zshrc
 COPY zshenv.snippet /usr/local/share/claude-docker/zshenv.snippet

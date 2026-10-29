@@ -4,6 +4,7 @@ ARG SINGBOX_VERSION=1.11.4
 ARG CONTAINER_TZ=America/Los_Angeles
 
 ENV DEBIAN_FRONTEND=noninteractive
+RUN sed -i "s|deb.debian.org|mirrors.aliyun.com|g" /etc/apt/sources.list.d/debian.sources
 
 RUN set -eux; \
     apt-get update; \
@@ -19,7 +20,7 @@ RUN set -eux; \
       arm64) sb_arch=arm64 ;; \
       *) echo "unsupported arch: $arch" >&2; exit 1 ;; \
     esac; \
-    curl -fsSL "https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/sing-box-${SINGBOX_VERSION}-linux-${sb_arch}.tar.gz" \
+    curl -fsSL "https://gh-proxy.com/https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/sing-box-${SINGBOX_VERSION}-linux-${sb_arch}.tar.gz" \
       | tar xzO "sing-box-${SINGBOX_VERSION}-linux-${sb_arch}/sing-box" > /usr/local/bin/sing-box; \
     chmod +x /usr/local/bin/sing-box
 
