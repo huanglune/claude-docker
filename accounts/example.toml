@@ -36,7 +36,7 @@ CLAUDE_UID = "1000"
 CLAUDE_GID = "1000"
 CLAUDE_HOME = "/home/claude"
 CLAUDE_RESOLV_CONF_SOURCE = "./accounts/example.resolv.conf"
-CLAUDE_EXTRA_APT_PACKAGES = "vim btop htop cmake build-essential libaio-dev gh libevent-dev libncurses-dev bison pkg-config fio iotop rsync gdb hwloc valgrind"
+CLAUDE_EXTRA_APT_PACKAGES = ""
 
 # 容器内缓存路径。默认都在 workspace 挂载里；启用 HOST_FAST_SSD 后也可以改到 $HOME/md1。
 CLAUDE_TMPDIR = "/home/claude/workspace/tmp"
