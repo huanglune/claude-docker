@@ -5,6 +5,8 @@ ARG CONTAINER_TZ=America/Los_Angeles
 ENV DEBIAN_FRONTEND=noninteractive \
     TZ="${CONTAINER_TZ}"
 
+RUN sed -i "s|deb.debian.org|mirrors.aliyun.com|g" /etc/apt/sources.list.d/debian.sources
+
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
