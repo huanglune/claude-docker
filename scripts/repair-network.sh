@@ -67,6 +67,9 @@ service_state() {
 }
 
 PROXY_IP="$(required_env_value PROXY_IP)"
+EXPECTED_EXIT_IP="$(required_env_value EXPECTED_EXIT_IP)"
+EXIT_CHECK_URL_VALUE="$(env_value EXIT_CHECK_URL)"
+EXIT_CHECK_URL_VALUE="${EXIT_CHECK_URL_VALUE:-https://www.cloudflare.com/cdn-cgi/trace}"
 
 title "Repair Claude Network Guard"
 
@@ -79,33 +82,28 @@ ok "proxy healthy" "$proxy_health"
 
 claude_state="$(service_state claude 2>/dev/null || true)"
 [[ "$claude_state" == "running" ]] || die "claude running" "${claude_state:-not found}"
+claude_container="$(docker compose ps -q claude)"
 ok "claude running" "$claude_state"
 
-section "Network Guard"
-guard_state="$(service_state network-guard 2>/dev/null || true)"
-[[ "$guard_state" == "running" ]] || die "network guard running" "${guard_state:-not found}; recreate the stack"
-guard_container="$(docker compose ps -q network-guard)"
-guard_health="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$guard_container")"
-ok "network guard running" "$guard_state (health=$guard_health)"
-
-guard_output="$(docker compose exec -T network-guard /usr/local/bin/network-guard.sh apply 2>&1)" \
+section "Re-applying Claude Network Guard"
+guard_output="$(docker compose exec -T -u 0 claude /usr/local/bin/claude-network-guard.sh apply 2>&1)" \
   && ok "network policy re-applied" "$guard_output" \
   || die "network policy re-applied" "$guard_output"
 
-guard_check="$(docker compose exec -T network-guard /usr/local/bin/network-guard.sh check 2>&1)" \
+guard_check="$(docker compose exec -T -u 0 claude /usr/local/bin/claude-network-guard.sh check 2>&1)" \
   && ok "network policy valid" "$guard_check" \
   || die "network policy valid" "$guard_check"
 
 for _ in $(seq 1 10); do
-  guard_health="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$guard_container")"
-  [[ "$guard_health" == "healthy" ]] && break
+  claude_health="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$claude_container")"
+  [[ "$claude_health" == "healthy" ]] && break
   sleep 1
 done
-[[ "$guard_health" == "healthy" ]] || die "network guard healthy after repair" "$guard_health"
-ok "network guard healthy after repair" "$guard_health"
+[[ "$claude_health" == "healthy" ]] || die "claude healthy after repair" "$claude_health"
+ok "claude healthy after repair" "$claude_health"
 
 section "Verification"
-route_line="$(docker compose exec -T claude bash -lc 'ip route | awk "/^default / { print; exit }"' 2>&1)" \
+route_line="$(docker compose exec -T claude /usr/local/bin/claude-exec bash -lc 'ip route | awk "/^default / { print; exit }"' 2>&1)" \
   || die "default route present" "$route_line"
 if [[ "$route_line" == default\ via\ "$PROXY_IP"\ * ]]; then
   ok "default route via proxy" "$route_line"
@@ -113,8 +111,15 @@ else
   die "default route via proxy" "$route_line"
 fi
 
-probe_output="$(docker compose exec -T claude bash -lc 'curl -fsS --connect-timeout 5 --max-time 15 https://api.ipify.org' 2>&1)" \
-  && ok "claude egress works" "$probe_output" \
-  || die "claude egress works" "$probe_output"
+trace_ip="$(docker compose exec -T claude /usr/local/bin/claude-exec bash -lc '
+  curl -fsS --connect-timeout 5 --max-time 15 "$1" \
+    | awk -F= '\''$1 == "ip" { gsub(/[[:space:]]/, "", $2); print $2; exit }'\''
+' bash "$EXIT_CHECK_URL_VALUE" 2>&1)" \
+  || die "claude egress works" "$trace_ip"
+if [[ "$trace_ip" == "$EXPECTED_EXIT_IP" ]]; then
+  ok "claude egress pinned to EXPECTED_EXIT_IP" "$trace_ip"
+else
+  die "claude egress pinned to EXPECTED_EXIT_IP" "expected=$EXPECTED_EXIT_IP actual=$trace_ip"
+fi
 
 printf '\n%s✓ Network guard repair complete%s\n' "$green" "$reset"

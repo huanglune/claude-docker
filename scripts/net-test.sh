@@ -28,9 +28,11 @@ HTTP_URL="${HTTP_URL:-https://www.google.com/generate_204}"
 DOWNLOAD_URL="${DOWNLOAD_URL:-https://speed.cloudflare.com/__down?bytes=${DOWNLOAD_BYTES}}"
 DNS_HOST="${DNS_HOST:-google.com}"
 CONNECT_URLS="${CONNECT_URLS:-https://www.google.com/generate_204 https://huggingface.co}"
+TRACE_URL="${EXIT_CHECK_URL:-https://www.cloudflare.com/cdn-cgi/trace}"
+EXPECTED_IP="${EXPECTED_EXIT_IP:-}"
 
-compose_exec() {
-  docker compose exec -T "$@"
+claude_exec() {
+  docker compose exec -T claude /usr/local/bin/claude-exec "$@"
 }
 
 title() {
@@ -136,12 +138,24 @@ printf '%s\n' "ROUNDS=$ROUNDS DOWNLOAD_ROUNDS=$DOWNLOAD_ROUNDS"
 ensure_running
 
 section "Exit IP"
-exit_ip="$(compose_exec claude bash -lc 'curl -fsS --max-time 20 https://api.ipify.org' 2>&1)" \
-  && ok "exit IP" "$exit_ip" \
-  || die "exit IP" "$exit_ip"
+trace_out="$(claude_exec bash -lc 'curl -fsS --max-time 20 "$1"' bash "$TRACE_URL" 2>&1)" \
+  || die "dual-stack trace" "$trace_out"
+trace_ip="$(awk -F= '$1 == "ip" { gsub(/[[:space:]]/, "", $2); print $2; exit }' <<<"$trace_out")"
+trace_loc="$(awk -F= '$1 == "loc" { gsub(/[^A-Za-z]/, "", $2); print toupper($2); exit }' <<<"$trace_out")"
+if [[ -n "$EXPECTED_IP" && "$trace_ip" != "$EXPECTED_IP" ]]; then
+  die "dual-stack exit IP" "expected=$EXPECTED_IP actual=$trace_ip"
+fi
+ok "dual-stack exit IP" "$trace_ip (loc=${trace_loc:-unknown})"
+
+exit_ip="$(claude_exec bash -lc 'curl -fsS --max-time 20 https://api.ipify.org' 2>&1)" \
+  || die "IPv4 exit IP" "$exit_ip"
+if [[ -n "$EXPECTED_IP" && "$exit_ip" != "$EXPECTED_IP" ]]; then
+  die "IPv4 exit IP" "expected=$EXPECTED_IP actual=$exit_ip"
+fi
+ok "IPv4 exit IP" "$exit_ip"
 
 section "DNS"
-dns_output="$(compose_exec claude bash -lc '
+dns_output="$(claude_exec bash -lc '
   set -euo pipefail
   host="$1"
   start="$(date +%s%3N)"
@@ -155,7 +169,7 @@ dns_output="$(compose_exec claude bash -lc '
 
 section "Connectivity"
 for url in $CONNECT_URLS; do
-  output="$(compose_exec claude bash -lc '
+  output="$(claude_exec bash -lc '
     set -euo pipefail
     curl -LsS --connect-timeout 8 --max-time 20 -o /dev/null \
       -w "code=%{http_code} connect=%{time_connect}s ttfb=%{time_starttransfer}s total=%{time_total}s remote=%{remote_ip}" \
@@ -172,14 +186,14 @@ trap 'rm -f "$latency_file" "$download_file"' EXIT
 printf 'run\tok\tdns_ms\tconnect_ms\tttfb_ms\ttotal_ms\tcode\tremote_ip\n' > "$latency_file"
 
 for run in $(seq 1 "$ROUNDS"); do
-  line="$(compose_exec claude bash -lc '
+  line="$(claude_exec bash -lc '
     set -euo pipefail
     url="$1"
     run="$2"
     out="$(curl -LfsS --connect-timeout 8 --max-time 30 -o /dev/null \
       -w "%{time_namelookup}\t%{time_connect}\t%{time_starttransfer}\t%{time_total}\t%{http_code}\t%{remote_ip}" \
       "$url" 2>&1)" || {
-        printf "%s\t0\t0\t0\t0\t0\t000\t%s\n" "$run" "$out"
+        printf "%s\t0\t0\t0\t0\t000\t%s\n" "$run" "$out"
         exit 0
       }
     IFS="$(printf "\t")" read -r dns connect ttfb total code remote_ip <<< "$out"
@@ -203,7 +217,7 @@ download_file="$(mktemp)"
 printf 'run\tok\tbytes\ttotal_s\tspeed_bps\tremote_ip\n' > "$download_file"
 
 for run in $(seq 1 "$DOWNLOAD_ROUNDS"); do
-  line="$(compose_exec claude bash -lc '
+  line="$(claude_exec bash -lc '
     set -euo pipefail
     url="$1"
     run="$2"
