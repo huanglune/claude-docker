@@ -203,19 +203,47 @@ section "Proxy Gateway"
 run_check "sing-box config is valid" \
   compose_exec proxy sing-box check -c /etc/sing-box/config.json
 
+if compose_exec proxy python3 - <<'PY' >/dev/null 2>&1
+import json
+import os
+import sys
+
+if not os.path.exists("/etc/xray/config.json"):
+    sys.exit(1)
+with open("/etc/xray/config.json", encoding="utf-8") as fh:
+    sys.exit(0 if json.load(fh).get("inbounds") else 1)
+PY
+then
+  run_check "xray config is valid" \
+    compose_exec proxy sh -lc 'xray run -test -config /etc/xray/config.json >/dev/null && pgrep -x xray >/dev/null'
+fi
+
 upstreams=()
 while IFS= read -r line || [[ -n "$line" ]]; do
   [[ -n "$line" ]] || continue
   upstreams+=("$line")
 done < <(compose_exec proxy python3 - <<'PY'
 import json
+import os
 
 with open("/etc/sing-box/config.json", encoding="utf-8") as fh:
     config = json.load(fh)
+xray_upstreams = {}
+if os.path.exists("/etc/xray/config.json"):
+    with open("/etc/xray/config.json", encoding="utf-8") as xfh:
+        xray_config = json.load(xfh)
+    for xout in xray_config.get("outbounds", []):
+        vnext = (xout.get("settings") or {}).get("vnext") or []
+        if xout.get("tag") and vnext:
+            xray_upstreams[xout["tag"]] = (vnext[0].get("address"), vnext[0].get("port", ""))
 for outbound in config["outbounds"]:
+    tag = outbound.get("tag", outbound.get("type"))
     server = outbound.get("server")
+    port = outbound.get("server_port", "")
+    if tag in xray_upstreams:
+        server, port = xray_upstreams[tag]
     if server:
-        print(f'{outbound.get("tag", outbound.get("type"))}\t{server}\t{outbound.get("server_port", "")}')
+        print(f"{tag}\t{server}\t{port}")
 PY
 )
 [[ "${#upstreams[@]}" -gt 0 ]] || die "proxy upstreams configured" "none found"
@@ -286,8 +314,17 @@ if proxy_only:
     for item in os.environ.get("PRIVATE_TCP_ALLOWLIST", "").replace(",", " ").split():
         host, port = item.rsplit(":", 1)
         expected_private_targets.add((str(ipaddress.ip_network(host, strict=False)), int(port)))
+    xray_upstreams = {}
+    if os.path.exists("/etc/xray/config.json"):
+        with open("/etc/xray/config.json", encoding="utf-8") as xfh:
+            xray_config = json.load(xfh)
+        for xout in xray_config.get("outbounds", []):
+            vnext = (xout.get("settings") or {}).get("vnext") or []
+            if xout.get("tag") and vnext:
+                xray_upstreams[xout["tag"]] = vnext[0].get("address")
     for outbound in config["outbounds"]:
-        server = outbound.get("server")
+        tag = outbound.get("tag")
+        server = xray_upstreams.get(tag) or outbound.get("server")
         if not server:
             continue
         ip = ipaddress.ip_address(server)

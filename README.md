@@ -323,7 +323,7 @@ uv run scripts/account-env.py net-test default
 - **TOML/权限错误**：真实账号 TOML 必须是 `0600`；resolver 必须只有该账号 `PROXY_IP` 的两行内容；不要在账号目录放模板占位 URI。
 - **proxy-only URI 错误**：服务器必须是 IPv4 字面量；SNI 用查询参数写域名。只支持 `vless`、`trojan`、`ss`；代理 URI 中的模板占位值会被拒绝。
 - **子网冲突**：`validate` 会检查现有 Docker 网络；新建账号可用 `create` 自动分配，手工修改时换一个 `/24`。
-- **proxy 一直 unhealthy**：healthcheck 依赖 `api.anthropic.com` 的 HTTPS 和 DNS。先看 `logs <账号> proxy`，再确认上游代理和 `DNS_SERVER` 可达；unhealthy 时网络会保持 fail-closed，这是预期行为。
+- **proxy 一直 unhealthy**：healthcheck 依赖 `www.cloudflare.com/cdn-cgi/trace` 的 HTTPS 和 DNS。先看 `logs <账号> proxy`，再确认上游代理和 `DNS_SERVER` 可达；unhealthy 时网络会保持 fail-closed，这是预期行为。
 - **Claude 无法上网但 proxy 健康**：查看 `ps`、`repair-network` 和 guard 健康状态；若 guard 被替换，执行 `up <账号>`，不要单独重建 guard。
 - **修改代码后没有生效**：`restart` 不会重建镜像；用 `up <账号>`（可加 `--force-recreate`）。改 TOML 后同样用 `up` 应用。
 - **Claude Code 需要升级**：可以进入容器执行 `sudo npm install -g @anthropic-ai/claude-code@latest`（会保留到容器重建）；要固化到镜像则重新构建 claude 镜像，构建会拉取当时的版本。

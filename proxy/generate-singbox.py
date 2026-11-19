@@ -5,12 +5,18 @@ import base64
 import ipaddress
 import json
 import os
+import socket
+import sys
 from dataclasses import dataclass, field
 from urllib.parse import parse_qs, unquote, urlparse
 
 
 TRUE_VALUES = ("1", "true", "yes", "on")
 FALSE_VALUES = ("0", "false", "no", "off", "")
+XRAY_PORTS = {
+    "proxy": 10808,
+    "download": 10809,
+}
 PRIVATE_EXCEPTION_NETWORKS = tuple(
     ipaddress.ip_network(cidr)
     for cidr in (
@@ -139,6 +145,9 @@ def parse_proxy(uri: str) -> ProxyConfig:
                 "fingerprint": params.get("fp", [""])[0],
                 "public_key": params.get("pbk", [""])[0],
                 "short_id": params.get("sid", [""])[0],
+                "spider_x": params.get("spx", [""])[0],
+                "encryption": params.get("encryption", ["none"])[0],
+                "mldsa65_verify": params.get("pqv", [""])[0],
                 "allow_insecure": params.get("allowInsecure", [""])[0],
             },
         )
@@ -186,7 +195,11 @@ def server_cidrs(server: str) -> list[str]:
     try:
         ip = ipaddress.ip_address(server)
     except ValueError:
-        return []
+        try:
+            _, _, ips = socket.gethostbyname_ex(server)
+        except OSError:
+            return []
+        return dedupe([f"{ipaddress.ip_address(item)}/32" for item in ips])
     return [f"{ip}/{'32' if ip.version == 4 else '128'}"]
 
 
@@ -301,17 +314,15 @@ def tls_config(proxy: ProxyConfig) -> dict | None:
 
 def outbound(proxy: ProxyConfig, tag: str) -> dict:
     if proxy.type == "vless":
-        out = {
-            "type": "vless",
+        if tag not in XRAY_PORTS:
+            raise ValueError(f"unsupported xray outbound tag: {tag}")
+        return {
+            "type": "socks",
             "tag": tag,
-            "server": proxy.server,
-            "server_port": proxy.port,
-            "uuid": proxy.uuid,
+            "server": "127.0.0.1",
+            "server_port": XRAY_PORTS[tag],
+            "version": "5",
         }
-        if proxy.extra.get("flow"):
-            out["flow"] = proxy.extra["flow"]
-        if proxy.extra.get("transport") and proxy.extra["transport"] != "tcp":
-            out["transport"] = {"type": proxy.extra["transport"]}
     elif proxy.type == "trojan":
         out = {
             "type": "trojan",
@@ -335,6 +346,115 @@ def outbound(proxy: ProxyConfig, tag: str) -> dict:
     if tls:
         out["tls"] = tls
     return out
+
+
+def xray_log_level(level: str) -> str:
+    normalized = level.strip().lower()
+    if normalized in ("trace", "debug"):
+        return "debug"
+    if normalized == "info":
+        return "info"
+    if normalized in ("warn", "warning"):
+        return "warning"
+    if normalized in ("error", "fatal", "panic"):
+        return "error"
+    return "warning"
+
+
+def xray_vless_outbound(proxy: ProxyConfig, tag: str) -> dict:
+    user: dict = {
+        "id": proxy.uuid,
+        "encryption": proxy.extra.get("encryption") or "none",
+    }
+    if proxy.extra.get("flow"):
+        user["flow"] = proxy.extra["flow"]
+
+    security = proxy.extra.get("security") or ("tls" if proxy.tls else "none")
+    stream_settings: dict = {
+        "network": proxy.extra.get("transport") or "tcp",
+        "security": security,
+    }
+    if security == "reality":
+        reality_settings: dict = {
+            "serverName": proxy.sni,
+            "fingerprint": proxy.extra.get("fingerprint") or "chrome",
+            "publicKey": proxy.extra.get("public_key", ""),
+            "shortId": proxy.extra.get("short_id", ""),
+            "spiderX": proxy.extra.get("spider_x", ""),
+            "show": False,
+        }
+        if proxy.extra.get("mldsa65_verify"):
+            reality_settings["mldsa65Verify"] = proxy.extra["mldsa65_verify"]
+        stream_settings["realitySettings"] = reality_settings
+    elif security == "tls":
+        tls_settings: dict = {
+            "allowInsecure": proxy.extra.get("allow_insecure") in ("1", "true", "True"),
+        }
+        if proxy.sni:
+            tls_settings["serverName"] = proxy.sni
+        if proxy.extra.get("fingerprint"):
+            tls_settings["fingerprint"] = proxy.extra["fingerprint"]
+        stream_settings["tlsSettings"] = tls_settings
+
+    return {
+        "tag": tag,
+        "protocol": "vless",
+        "settings": {
+            "vnext": [
+                {
+                    "address": proxy.server,
+                    "port": proxy.port,
+                    "users": [user],
+                }
+            ]
+        },
+        "streamSettings": stream_settings,
+    }
+
+
+def build_xray_config(
+    proxy: ProxyConfig,
+    download_proxy: ProxyConfig | None,
+    runtime: RuntimeConfig,
+) -> dict:
+    inbounds: list[dict] = []
+    outbounds: list[dict] = []
+    rules: list[dict] = []
+
+    for tag, item in (("proxy", proxy), ("download", download_proxy)):
+        if item is None or item.type != "vless":
+            continue
+        inbound_tag = f"socks-{tag}"
+        inbounds.append(
+            {
+                "tag": inbound_tag,
+                "listen": "127.0.0.1",
+                "port": XRAY_PORTS[tag],
+                "protocol": "socks",
+                "settings": {
+                    "auth": "noauth",
+                    "udp": True,
+                },
+            }
+        )
+        outbounds.append(xray_vless_outbound(item, tag))
+        rules.append(
+            {
+                "type": "field",
+                "inboundTag": [inbound_tag],
+                "outboundTag": tag,
+            }
+        )
+
+    return {
+        "log": {"loglevel": xray_log_level(runtime.log_level)},
+        "inbounds": inbounds,
+        "outbounds": outbounds,
+        "routing": {
+            "domainStrategy": "AsIs",
+            "rules": rules,
+        },
+    }
 
 
 def route_excludes(proxies: list[ProxyConfig], runtime: RuntimeConfig) -> list[str]:
@@ -446,7 +566,10 @@ def main() -> None:
     download_proxy_uri = os.environ.get("DOWNLOAD_PROXY_URI") or os.environ.get("DIRECT_PROXY_URI", "")
     download_proxy = parse_proxy(download_proxy_uri) if download_proxy_uri.strip() else None
     runtime = RuntimeConfig.from_env()
-    print(json.dumps(build_config(proxy, download_proxy, runtime), indent=2))
+    if "--xray" in sys.argv[1:]:
+        print(json.dumps(build_xray_config(proxy, download_proxy, runtime), indent=2))
+    else:
+        print(json.dumps(build_config(proxy, download_proxy, runtime), indent=2))
 
 
 if __name__ == "__main__":

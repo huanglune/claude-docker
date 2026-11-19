@@ -52,7 +52,7 @@ services:
     dns_search:
       - .
     healthcheck:
-      test: ["CMD-SHELL", "curl -sS -I --connect-timeout 5 --max-time 8 https://api.anthropic.com >/dev/null"]
+      test: ["CMD-SHELL", "curl -fsS --connect-timeout 5 --max-time 8 https://www.cloudflare.com/cdn-cgi/trace >/dev/null"]
       interval: 20s
       timeout: 10s
       retries: 6

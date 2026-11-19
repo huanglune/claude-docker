@@ -53,13 +53,25 @@ iptables -w -F "$chain"
 
 python3 - <<'PY' | while read -r server port; do
 import json
+import os
 
 with open("/etc/sing-box/config.json", encoding="utf-8") as fh:
     config = json.load(fh)
+xray_upstreams = {}
+if os.path.exists("/etc/xray/config.json"):
+    with open("/etc/xray/config.json", encoding="utf-8") as xfh:
+        xray_config = json.load(xfh)
+    for xout in xray_config.get("outbounds", []):
+        vnext = (xout.get("settings") or {}).get("vnext") or []
+        if xout.get("tag") and vnext:
+            xray_upstreams[xout["tag"]] = (vnext[0].get("address"), vnext[0].get("port"))
 seen = set()
 for outbound in config["outbounds"]:
+    tag = outbound.get("tag")
     server = outbound.get("server")
     port = outbound.get("server_port")
+    if tag in xray_upstreams:
+        server, port = xray_upstreams[tag]
     if server and port and (server, port) not in seen:
         seen.add((server, port))
         print(f"{server}\t{port}")
