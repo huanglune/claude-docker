@@ -19,20 +19,29 @@ import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NoReturn
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 
 ROOT = Path(__file__).resolve().parent.parent
 BASE_COMPOSE = ROOT / "docker-compose.yml"
-FAST_SSD_COMPOSE = ROOT / "docker-compose.fast-ssd.yml"
-TEST_COMPOSE = ROOT / "docker-compose.test.yml"
 ACCOUNTS_DIR = ROOT / "accounts"
 TEMPLATE = ACCOUNTS_DIR / "example.toml"
 DOWNLOAD_DOMAINS_TEMPLATE = ROOT / "proxy" / "download-domains.txt"
 
 ACCOUNT_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,47}$")
 PROJECT_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+([A-Za-z0-9._-]*)?$")
 SUPPORTED_PROXY_SCHEMES = {"vless", "trojan", "ss"}
+DOC_IPV4_NETWORKS = tuple(
+    ipaddress.ip_network(cidr)
+    for cidr in (
+        "192.0.2.0/24",
+        "198.51.100.0/24",
+        "203.0.113.0/24",
+    )
+)
+PROXY_URI_SCAN_RE = re.compile(r"(?i)\b(?:vless|trojan|ss)://[^\s\"'`<>]+")
+HOST_USERS_PATH_RE = re.compile(r"/Users/[A-Za-z0-9][A-Za-z0-9._-]*")
 PRIVATE_EXCEPTION_NETWORKS = tuple(
     ipaddress.ip_network(cidr)
     for cidr in (
@@ -47,19 +56,16 @@ PRIVATE_EXCEPTION_NETWORKS = tuple(
 ENV_KEYS = {
     "PROXY_IMAGE",
     "CLAUDE_IMAGE",
+    "XRAY_VERSION",
+    "TZ",
     "PROXY_URI",
     "DOWNLOAD_PROXY_URI",
     "DOWNLOAD_DOMAIN_SOURCE",
-    "DOWNLOAD_DOMAIN_FILE",
     "DNS_SERVER",
     "TUN_ADDRESS",
     "TUN_MTU",
     "LOG_LEVEL",
-    "DNS_HIJACK",
-    "SINGBOX_VERSION",
-    "TZ",
     "HOST_WORKSPACE",
-    "HOST_FAST_SSD",
     "CLAUDE_USER",
     "CLAUDE_UID",
     "CLAUDE_GID",
@@ -72,43 +78,34 @@ ENV_KEYS = {
     "CLAUDE_PIP_CACHE_DIR",
     "CLAUDE_UV_CACHE_DIR",
     "CLAUDE_UV_PYTHON_INSTALL_DIR",
-    "CLAUDE_HF_HOME",
-    "CLAUDE_HF_ENDPOINT",
-    "CLAUDE_TOKENIZERS_PARALLELISM",
     "LOCKED_SUBNET",
     "PROXY_IP",
     "CLAUDE_IP",
-    "DIRECT_PROXY_LISTEN",
     "DIRECT_PROXY_PORT",
-    "ROUTE_EXCLUDE_CIDRS",
     "BLOCK_PRIVATE_CIDRS",
     "PRIVATE_TCP_ALLOWLIST",
-    "PROXY_ONLY",
+    "EXPECTED_EXIT_IP",
     "EXIT_COUNTRY_DENYLIST",
-    "EXIT_COUNTRY_CHECK_URL",
-    "EXIT_COUNTRY_CHECK_INTERVAL",
+    "EXIT_CHECK_URL",
+    "EXIT_CHECK_INTERVAL",
     "EGRESS_DENY_INTERFACES",
 }
 
 EMPTY_ALLOWED = {
     "CLAUDE_EXTRA_APT_PACKAGES",
-    "HOST_FAST_SSD",
     "PRIVATE_TCP_ALLOWLIST",
     "EXIT_COUNTRY_DENYLIST",
     "EGRESS_DENY_INTERFACES",
 }
 
-ABSOLUTE_CONTAINER_PATH_KEYS = {
-    "DOWNLOAD_DOMAIN_FILE",
-    "CLAUDE_HOME",
+CACHE_CONTAINER_PATH_KEYS = (
     "CLAUDE_TMPDIR",
     "CLAUDE_XDG_CACHE_HOME",
     "CLAUDE_NPM_CONFIG_CACHE",
     "CLAUDE_PIP_CACHE_DIR",
     "CLAUDE_UV_CACHE_DIR",
     "CLAUDE_UV_PYTHON_INSTALL_DIR",
-    "CLAUDE_HF_HOME",
-}
+)
 
 
 class ConfigError(RuntimeError):
@@ -127,7 +124,7 @@ class AccountConfig:
         env = os.environ.copy()
         env.update(self.environment)
         env["COMPOSE_PROJECT_NAME"] = self.project
-        env["COMPOSE_FILE"] = os.pathsep.join(str(path) for path in compose_files(self.environment))
+        env["COMPOSE_FILE"] = str(BASE_COMPOSE)
         env["COMPOSE_DISABLE_ENV_FILE"] = "1"
         env["CLAUDE_CONFIG_SOURCE"] = f"toml:{self.account}"
         return env
@@ -142,7 +139,9 @@ def expected_project_name(account: str) -> str:
     return "claude-docker" if account == "default" else f"claude-docker-{account}"
 
 
-def run_capture(command: list[str], *, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+def run_capture(
+    command: list[str], *, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run(
             command,
@@ -177,8 +176,7 @@ def egress_deny_patterns(value: str) -> list[str]:
             or ("*" in item and not item.endswith("*"))
         ):
             raise ConfigError(
-                "EGRESS_DENY_INTERFACES 只接受接口名，或以后缀 * 表示的前缀: "
-                f"{item}"
+                f"EGRESS_DENY_INTERFACES 只接受接口名，或以后缀 * 表示的前缀: {item}"
             )
         patterns.append(item)
     return patterns
@@ -218,23 +216,14 @@ def host_route_interface(host: str) -> str:
     raise ConfigError(f"主机路由 {host} 没有接口")
 
 
-def assert_egress_ignore(environment: dict[str, str], *, test: bool = False) -> None:
+def assert_egress_ignore(environment: dict[str, str]) -> None:
     patterns = egress_deny_patterns(environment.get("EGRESS_DENY_INTERFACES", ""))
     if not patterns:
         return
-    if test:
-        endpoints = (
-            ("PROXY_URI", environment.get("TEST_PROXY_URI") or environment.get("PROXY_URI", "")),
-            (
-                "DOWNLOAD_PROXY_URI",
-                environment.get("TEST_DOWNLOAD_PROXY_URI") or environment.get("DOWNLOAD_PROXY_URI", ""),
-            ),
-        )
-    else:
-        endpoints = (
-            ("PROXY_URI", environment.get("PROXY_URI", "")),
-            ("DOWNLOAD_PROXY_URI", environment.get("DOWNLOAD_PROXY_URI", "")),
-        )
+    endpoints = (
+        ("PROXY_URI", environment.get("PROXY_URI", "")),
+        ("DOWNLOAD_PROXY_URI", environment.get("DOWNLOAD_PROXY_URI", "")),
+    )
     seen: set[str] = set()
     for key, uri in endpoints:
         host = urlsplit(uri).hostname or ""
@@ -287,12 +276,7 @@ def parse_positive_int(environment: dict[str, str], key: str, minimum: int, maxi
     return value
 
 
-def validate_proxy_uri(
-    key: str,
-    value: str,
-    *,
-    allow_template: bool = False,
-) -> None:
+def validate_proxy_uri(key: str, value: str, *, allow_template: bool = False) -> None:
     scheme = urlsplit(value).scheme.lower()
     if scheme not in SUPPORTED_PROXY_SCHEMES:
         supported = ", ".join(sorted(SUPPORTED_PROXY_SCHEMES))
@@ -361,7 +345,16 @@ def validate_resolver_file(value: str, proxy_ip: ipaddress.IPv4Address) -> None:
         )
 
 
-def validate_environment(account: str, project: str, environment: dict[str, str]) -> ipaddress.IPv4Network:
+def require_host_directory(key: str, value: str) -> Path:
+    path = Path(value)
+    if not path.is_absolute() or path == Path("/") or ".." in path.parts:
+        raise ConfigError(f"{key} 必须是非根目录的绝对路径")
+    return path
+
+
+def validate_environment(
+    account: str, project: str, environment: dict[str, str]
+) -> ipaddress.IPv4Network:
     missing = sorted(ENV_KEYS - environment.keys())
     unknown = sorted(environment.keys() - ENV_KEYS)
     if missing:
@@ -379,20 +372,55 @@ def validate_environment(account: str, project: str, environment: dict[str, str]
     if not PROJECT_RE.fullmatch(project):
         raise ConfigError(f"无效 Compose 项目名: {project}")
 
+    if not VERSION_RE.fullmatch(environment["XRAY_VERSION"]):
+        raise ConfigError(f"XRAY_VERSION 格式无效: {environment['XRAY_VERSION']}")
+
     allow_template = account == "example"
     validate_proxy_uri("PROXY_URI", environment["PROXY_URI"], allow_template=allow_template)
-    validate_proxy_uri("DOWNLOAD_PROXY_URI", environment["DOWNLOAD_PROXY_URI"], allow_template=allow_template)
-    if not allow_template:
-        for key in ("PROXY_URI", "DOWNLOAD_PROXY_URI"):
-            hostname = urlsplit(environment[key]).hostname
-            try:
-                upstream_ip = ipaddress.ip_address(hostname or "")
-            except ValueError as exc:
+    validate_proxy_uri(
+        "DOWNLOAD_PROXY_URI", environment["DOWNLOAD_PROXY_URI"], allow_template=allow_template
+    )
+    for key in ("PROXY_URI", "DOWNLOAD_PROXY_URI"):
+        parsed_uri = urlsplit(environment[key])
+        hostname = parsed_uri.hostname
+        try:
+            upstream_ip = ipaddress.ip_address(hostname or "")
+        except ValueError as exc:
+            raise ConfigError(
+                f"{key} 服务器部分必须是 IPv4 字面量，TLS SNI 仍可使用域名"
+            ) from exc
+        if upstream_ip.version != 4 or upstream_ip.is_unspecified:
+            raise ConfigError(f"{key} 服务器部分必须是有效的 IPv4 字面量")
+        if allow_template:
+            if not any(upstream_ip in net for net in DOC_IPV4_NETWORKS):
                 raise ConfigError(
-                    f"proxy-only 账号的 {key} 服务器部分必须是 IPv4 字面量，TLS SNI 仍可使用域名"
-                ) from exc
-            if upstream_ip.version != 4:
-                raise ConfigError(f"proxy-only 账号的 {key} 服务器部分必须是 IPv4 字面量")
+                    f"example.toml 的 {key} 只能使用 RFC 5737 示例地址，当前为 {upstream_ip}"
+                )
+            for sni in parse_qs(parsed_uri.query).get("sni", []):
+                if sni and sni != "example.com" and not sni.endswith(".example.com"):
+                    raise ConfigError(f"example.toml 的 {key} SNI 只能使用 *.example.com")
+
+    try:
+        expected_exit_ip = ipaddress.ip_address(environment["EXPECTED_EXIT_IP"])
+    except ValueError as exc:
+        raise ConfigError("EXPECTED_EXIT_IP 必须是有效的 IPv4 地址") from exc
+    if expected_exit_ip.version != 4:
+        raise ConfigError("EXPECTED_EXIT_IP 必须是公网 IPv4 地址")
+    if allow_template:
+        if not any(expected_exit_ip in net for net in DOC_IPV4_NETWORKS):
+            raise ConfigError(
+                f"example.toml 的 EXPECTED_EXIT_IP 只能使用 RFC 5737 示例地址: {expected_exit_ip}"
+            )
+        if environment["CLAUDE_USER"] != "claude":
+            raise ConfigError("example.toml 的 CLAUDE_USER 必须保持脱敏默认值 'claude'")
+        if environment["PRIVATE_TCP_ALLOWLIST"].strip():
+            raise ConfigError("example.toml 的 PRIVATE_TCP_ALLOWLIST 必须保持为空")
+        if environment["HOST_WORKSPACE"].startswith(("/Users/", "/home/")):
+            raise ConfigError("example.toml 的 HOST_WORKSPACE 不能包含个人宿主目录路径")
+    elif not expected_exit_ip.is_global:
+        raise ConfigError(
+            f"EXPECTED_EXIT_IP 必须是真实的公网 IPv4 地址（不能使用示例/私网地址）: {expected_exit_ip}"
+        )
 
     for key in ("PROXY_IMAGE", "CLAUDE_IMAGE"):
         if any(char.isspace() for char in environment[key]):
@@ -405,47 +433,37 @@ def validate_environment(account: str, project: str, environment: dict[str, str]
     parse_positive_int(environment, "TUN_MTU", 576, 65535)
     parse_positive_int(environment, "DIRECT_PROXY_PORT", 1, 65535)
 
-    for key in ("DNS_HIJACK", "CLAUDE_TOKENIZERS_PARALLELISM", "PROXY_ONLY"):
-        if environment[key].lower() not in {"0", "1", "true", "false", "yes", "no", "on", "off"}:
-            raise ConfigError(f"{key} 不是有效布尔值: {environment[key]}")
-    if environment["LOG_LEVEL"] not in {
+    if environment["LOG_LEVEL"].lower() not in {
         "trace",
         "debug",
         "info",
         "warn",
+        "warning",
         "error",
         "fatal",
         "panic",
+        "none",
     }:
-        raise ConfigError(f"LOG_LEVEL 不是有效的 sing-box 日志级别: {environment['LOG_LEVEL']}")
+        raise ConfigError(f"LOG_LEVEL 不是有效日志级别: {environment['LOG_LEVEL']}")
     if not re.fullmatch(r"[a-z_][a-z0-9_-]*", environment["CLAUDE_USER"]):
         raise ConfigError("CLAUDE_USER 必须是合法的小写 Linux 用户名")
 
-    if environment["PROXY_ONLY"].lower() not in {"1", "true", "yes", "on"}:
-        raise ConfigError("账号环境必须保持 PROXY_ONLY=true")
     denied_countries = {
         item.upper() for item in environment["EXIT_COUNTRY_DENYLIST"].replace(",", " ").split()
     }
-    invalid_countries = sorted(item for item in denied_countries if not re.fullmatch(r"[A-Z]{2}", item))
+    invalid_countries = sorted(
+        item for item in denied_countries if not re.fullmatch(r"[A-Z]{2}", item)
+    )
     if invalid_countries:
         raise ConfigError(f"EXIT_COUNTRY_DENYLIST 含无效国家代码: {', '.join(invalid_countries)}")
-    if denied_countries and not environment["EXIT_COUNTRY_CHECK_URL"].startswith("https://"):
-        raise ConfigError("EXIT_COUNTRY_CHECK_URL 必须使用 https://")
-    parse_positive_int(environment, "EXIT_COUNTRY_CHECK_INTERVAL", 10, 3600)
+    if not environment["EXIT_CHECK_URL"].startswith("https://"):
+        raise ConfigError("EXIT_CHECK_URL 必须使用 https://")
+    parse_positive_int(environment, "EXIT_CHECK_INTERVAL", 10, 3600)
     egress_deny_patterns(environment["EGRESS_DENY_INTERFACES"])
 
-    host_workspace = require_host_directory("HOST_WORKSPACE", environment["HOST_WORKSPACE"])
-    host_fast_ssd = environment["HOST_FAST_SSD"].strip()
-    if host_fast_ssd:
-        fast_ssd_path = require_host_directory("HOST_FAST_SSD", host_fast_ssd)
-        if (
-            host_workspace == fast_ssd_path
-            or host_workspace in fast_ssd_path.parents
-            or fast_ssd_path in host_workspace.parents
-        ):
-            raise ConfigError("HOST_WORKSPACE 与 HOST_FAST_SSD 必须是互不嵌套的不同目录")
+    require_host_directory("HOST_WORKSPACE", environment["HOST_WORKSPACE"])
 
-    for key in ABSOLUTE_CONTAINER_PATH_KEYS:
+    for key in ("CLAUDE_HOME", *CACHE_CONTAINER_PATH_KEYS):
         path = Path(environment[key])
         if not path.is_absolute() or ".." in path.parts:
             raise ConfigError(f"{key} 必须是容器内绝对路径")
@@ -456,26 +474,7 @@ def validate_environment(account: str, project: str, environment: dict[str, str]
         raise ConfigError(f"CLAUDE_HOME 必须是 {expected_home}，以匹配 Dockerfile 创建的用户目录")
 
     container_workspace = home / "workspace"
-    flexible_roots = [container_workspace]
-    if host_fast_ssd:
-        flexible_roots.append(home / "md1")
-    flexible_keys = (
-        "CLAUDE_TMPDIR",
-        "CLAUDE_XDG_CACHE_HOME",
-        "CLAUDE_NPM_CONFIG_CACHE",
-        "CLAUDE_PIP_CACHE_DIR",
-    )
-    workspace_keys = (
-        "CLAUDE_UV_CACHE_DIR",
-        "CLAUDE_UV_PYTHON_INSTALL_DIR",
-        "CLAUDE_HF_HOME",
-    )
-    for key in flexible_keys:
-        path = Path(environment[key])
-        if not any(path == root or root in path.parents for root in flexible_roots):
-            allowed = "$HOME/workspace" if not host_fast_ssd else "$HOME/workspace 或 $HOME/md1"
-            raise ConfigError(f"{key} 必须位于已挂载的目录内: {allowed}")
-    for key in workspace_keys:
+    for key in CACHE_CONTAINER_PATH_KEYS:
         path = Path(environment[key])
         if path != container_workspace and container_workspace not in path.parents:
             raise ConfigError(f"{key} 必须位于 $HOME/workspace 内")
@@ -485,7 +484,8 @@ def validate_environment(account: str, project: str, environment: dict[str, str]
         raise ConfigError(f"DOWNLOAD_DOMAIN_SOURCE 文件不存在: {source}")
     try:
         has_download_domain = any(
-            line.split("#", 1)[0].strip() for line in source.read_text(encoding="utf-8").splitlines()
+            line.split("#", 1)[0].strip()
+            for line in source.read_text(encoding="utf-8").splitlines()
         )
     except OSError as exc:
         raise ConfigError(f"无法读取 DOWNLOAD_DOMAIN_SOURCE: {source}: {exc}") from exc
@@ -496,19 +496,18 @@ def validate_environment(account: str, project: str, environment: dict[str, str]
         dns_server = ipaddress.ip_address(environment["DNS_SERVER"])
     except ValueError as exc:
         raise ConfigError("DNS_SERVER 必须是 IPv4 地址") from exc
-    if dns_server.version != 4:
-        raise ConfigError("DNS_SERVER 必须是 IPv4 地址")
+    if dns_server.version != 4 or dns_server.is_unspecified:
+        raise ConfigError("DNS_SERVER 必须是具体的 IPv4 地址")
 
     try:
         locked = ipaddress.ip_network(environment["LOCKED_SUBNET"], strict=True)
         proxy_ip = ipaddress.ip_address(environment["PROXY_IP"])
         claude_ip = ipaddress.ip_address(environment["CLAUDE_IP"])
-        direct_listen = ipaddress.ip_address(environment["DIRECT_PROXY_LISTEN"])
         tun = ipaddress.ip_interface(environment["TUN_ADDRESS"])
     except ValueError as exc:
         raise ConfigError(f"网络地址配置无效: {exc}") from exc
     if locked.version != 4 or proxy_ip.version != 4 or claude_ip.version != 4 or tun.version != 4:
-        raise ConfigError("账号网络目前只支持 IPv4")
+        raise ConfigError("账号网络只支持 IPv4")
     if locked.prefixlen != 24:
         raise ConfigError("LOCKED_SUBNET 必须是独立的 IPv4 /24 子网")
     if proxy_ip not in locked or claude_ip not in locked:
@@ -520,19 +519,17 @@ def validate_environment(account: str, project: str, environment: dict[str, str]
         raise ConfigError("PROXY_IP 和 CLAUDE_IP 不能使用网络地址或广播地址")
     if proxy_ip == claude_ip:
         raise ConfigError("PROXY_IP 与 CLAUDE_IP 不能相同")
-    if any(addr.is_unspecified for addr in (proxy_ip, claude_ip, direct_listen)):
-        raise ConfigError("PROXY_IP、CLAUDE_IP、DIRECT_PROXY_LISTEN 必须是具体地址，不能使用 0.0.0.0")
-    if direct_listen != proxy_ip:
-        raise ConfigError("DIRECT_PROXY_LISTEN 必须与 PROXY_IP 相同")
+    if any(addr.is_unspecified for addr in (proxy_ip, claude_ip)):
+        raise ConfigError("PROXY_IP 和 CLAUDE_IP 不能使用 0.0.0.0")
     validate_resolver_file(environment["CLAUDE_RESOLV_CONF_SOURCE"], proxy_ip)
     if tun.network.overlaps(locked):
         raise ConfigError("TUN_ADDRESS 与 LOCKED_SUBNET 不能重叠")
-    if tun.network.num_addresses < 4 or tun.ip in {tun.network.network_address, tun.network.broadcast_address}:
+    if tun.network.num_addresses < 4 or tun.ip in {
+        tun.network.network_address,
+        tun.network.broadcast_address,
+    }:
         raise ConfigError("TUN_ADDRESS 必须包含本机地址和至少一个可用 peer（建议使用 /30）")
 
-    route_excludes = parse_cidr_list("ROUTE_EXCLUDE_CIDRS", environment["ROUTE_EXCLUDE_CIDRS"])
-    if set(route_excludes) != {locked}:
-        raise ConfigError("PROXY_ONLY=true 时 ROUTE_EXCLUDE_CIDRS 必须与 LOCKED_SUBNET 完全相同")
     blocked_networks = parse_cidr_list("BLOCK_PRIVATE_CIDRS", environment["BLOCK_PRIVATE_CIDRS"])
     validate_private_allowlist(
         environment["PRIVATE_TCP_ALLOWLIST"],
@@ -547,7 +544,9 @@ def load_account(account: str) -> AccountConfig:
         raise ConfigError("账号名只能包含小写字母、数字和连字符，长度不超过 48")
     path = ACCOUNTS_DIR / f"{account}.toml"
     if not path.is_file():
-        raise ConfigError(f"账号配置不存在: {path}；先运行 uv run scripts/account-env.py create {account}")
+        raise ConfigError(
+            f"账号配置不存在: {path}；先运行 uv run scripts/account-env.py create {account}"
+        )
     if account != "example" and stat.S_IMODE(path.stat().st_mode) & 0o077:
         raise ConfigError(f"账号 TOML 包含代理凭据，权限必须是 0600；请运行 chmod 600 {path}")
 
@@ -567,12 +566,14 @@ def load_account(account: str) -> AccountConfig:
     raw_environment = parsed.get("environment")
     if not isinstance(raw_environment, dict):
         raise ConfigError("账号 TOML 缺少 [environment] 表")
-    environment = {str(key): scalar_to_string(str(key), value) for key, value in raw_environment.items()}
+    environment = {
+        str(key): scalar_to_string(str(key), value) for key, value in raw_environment.items()
+    }
     locked = validate_environment(account, project, environment)
     return AccountConfig(account, project, path, environment, locked)
 
 
-def docker_networks() -> list[tuple[str, str | None, ipaddress._BaseNetwork]]:
+def docker_networks() -> list[tuple[str, str | None, ipaddress._BaseNetwork, dict[str, str]]]:
     listed = run_capture(["docker", "network", "ls", "-q"])
     if listed.returncode != 0:
         return []
@@ -587,17 +588,20 @@ def docker_networks() -> list[tuple[str, str | None, ipaddress._BaseNetwork]]:
     except json.JSONDecodeError:
         return []
 
-    result: list[tuple[str, str | None, ipaddress._BaseNetwork]] = []
+    result: list[tuple[str, str | None, ipaddress._BaseNetwork, dict[str, str]]] = []
     for record in records:
         name = str(record.get("Name", "<unknown>"))
         labels = record.get("Labels") or {}
         project = labels.get("com.docker.compose.project") if isinstance(labels, dict) else None
+        options = record.get("Options") if isinstance(record.get("Options"), dict) else {}
         for config in (record.get("IPAM") or {}).get("Config") or []:
             subnet = config.get("Subnet") if isinstance(config, dict) else None
             if not subnet:
                 continue
             try:
-                result.append((name, project, ipaddress.ip_network(subnet, strict=False)))
+                result.append(
+                    (name, project, ipaddress.ip_network(subnet, strict=False), options)
+                )
             except ValueError:
                 continue
     return result
@@ -605,14 +609,16 @@ def docker_networks() -> list[tuple[str, str | None, ipaddress._BaseNetwork]]:
 
 def assert_no_network_conflict(config: AccountConfig) -> None:
     conflicts = []
-    for name, project, network in docker_networks():
+    for name, project, network, _ in docker_networks():
         if (
             project == config.project
             and name == f"{config.project}_locked"
             and network == config.locked_subnet
         ):
             continue
-        if network.version == config.locked_subnet.version and network.overlaps(config.locked_subnet):
+        if network.version == config.locked_subnet.version and network.overlaps(
+            config.locked_subnet
+        ):
             conflicts.append(f"{name} ({network})")
     if conflicts:
         raise ConfigError(
@@ -620,51 +626,7 @@ def assert_no_network_conflict(config: AccountConfig) -> None:
         )
 
 
-def require_host_directory(key: str, value: str) -> Path:
-    path = Path(value)
-    if not path.is_absolute() or path == Path("/") or ".." in path.parts:
-        raise ConfigError(f"{key} 必须是非根目录的绝对路径")
-    return path
-
-
-def compose_files(environment: dict[str, str]) -> list[Path]:
-    files = [BASE_COMPOSE]
-    if environment.get("HOST_FAST_SSD", "").strip():
-        files.append(FAST_SSD_COMPOSE)
-    return files
-
-
 def compose_prefix(config: AccountConfig) -> list[str]:
-    command = [
-        "docker",
-        "compose",
-        "--env-file",
-        os.devnull,
-        "--project-directory",
-        str(ROOT),
-        "-p",
-        config.project,
-    ]
-    for path in compose_files(config.environment):
-        command.extend(["-f", str(path)])
-    return command
-
-
-def test_project_name(config: AccountConfig) -> str:
-    return f"{config.project}-test"
-
-
-def test_process_environment(config: AccountConfig) -> dict[str, str]:
-    env = config.process_environment()
-    env["COMPOSE_PROJECT_NAME"] = test_project_name(config)
-    env["COMPOSE_FILE"] = str(TEST_COMPOSE)
-    env["CLAUDE_CONFIG_SOURCE"] = f"toml:{config.account}:test"
-    env["TEST_PROXY_ONLY"] = "true"
-    env["TEST_EXIT_COUNTRY_DENYLIST"] = ""
-    return env
-
-
-def test_compose_prefix(config: AccountConfig) -> list[str]:
     return [
         "docker",
         "compose",
@@ -673,9 +635,9 @@ def test_compose_prefix(config: AccountConfig) -> list[str]:
         "--project-directory",
         str(ROOT),
         "-p",
-        test_project_name(config),
+        config.project,
         "-f",
-        str(TEST_COMPOSE),
+        str(BASE_COMPOSE),
     ]
 
 
@@ -702,7 +664,7 @@ def inspect_value(container: str, template: str) -> str:
     return result.stdout.strip()
 
 
-def wait_for_guard(container: str, timeout: int = 90) -> None:
+def wait_for_healthy(service: str, container: str, timeout: int = 90) -> None:
     deadline = time.monotonic() + timeout
     last = "unknown"
     while time.monotonic() < deadline:
@@ -715,61 +677,43 @@ def wait_for_guard(container: str, timeout: int = 90) -> None:
         if last.startswith(("dead/", "exited/")):
             break
         time.sleep(1)
-    raise ConfigError(f"network-guard 未在 {timeout} 秒内健康: {last}")
+    raise ConfigError(f"{service} 未在 {timeout} 秒内健康: {last}")
 
 
-def exec_netns(container: str) -> str:
-    result = run_capture(["docker", "exec", container, "readlink", "/proc/self/ns/net"])
-    if result.returncode != 0:
-        detail = result.stderr.strip() or result.stdout.strip()
-        raise ConfigError(f"无法读取容器 {container[:12]} 的网络命名空间: {detail}")
-    return result.stdout.strip()
+def needs_topology_migration(config: AccountConfig) -> bool:
+    """Detect legacy 3-container or pre-inhibit_ipv4 network resources for clean recreation."""
+    legacy_guard = run_capture(
+        [
+            "docker",
+            "ps",
+            "-a",
+            "--filter",
+            f"label=com.docker.compose.project={config.project}",
+            "--filter",
+            "label=com.docker.compose.service=network-guard",
+            "-q",
+        ]
+    )
+    if legacy_guard.returncode == 0 and legacy_guard.stdout.strip():
+        return True
+
+    locked_name = f"{config.project}_locked"
+    for name, project, _, options in docker_networks():
+        if project == config.project and name == locked_name:
+            if options.get("com.docker.network.bridge.inhibit_ipv4") != "true":
+                return True
+    return False
 
 
-def ensure_network_guard_topology(
-    compose: list[str],
-    environment: dict[str, str],
-) -> None:
-    guard = compose_container_id(compose, environment, "network-guard")
-    wait_for_guard(guard)
-    claude = compose_container_id(compose, environment, "claude")
-
-    expected_mode = f"container:{guard}"
-    actual_mode = inspect_value(claude, "{{.HostConfig.NetworkMode}}")
-    if actual_mode != expected_mode:
-        print("检测到 Claude 仍引用旧 network-guard；正在联动重建 Claude…")
-        run_foreground(
-            compose + ["up", "-d", "--no-deps", "--force-recreate", "claude"],
-            env=environment,
-        )
-        claude = compose_container_id(compose, environment, "claude")
-        actual_mode = inspect_value(claude, "{{.HostConfig.NetworkMode}}")
-        if actual_mode != expected_mode:
-            raise ConfigError(
-                "Claude 未绑定当前 network-guard，已保持 fail-closed；请执行 down 后重新 up"
-            )
-
-    claude_state = inspect_value(claude, "{{.State.Status}}")
-    if claude_state != "running":
-        print(
-            f"Claude 当前为 {claude_state}；已验证其绑定当前 network-guard，"
-            "实际 netns 将在下次启动后复核"
-        )
-        return
-
-    guard_netns = exec_netns(guard)
-    claude_netns = exec_netns(claude)
-    if guard_netns and guard_netns != claude_netns:
-        print("检测到 network-guard 已进入新 netns；正在重启 Claude 以重新加入…")
-        run_foreground(compose + ["restart", "claude"], env=environment)
-        claude = compose_container_id(compose, environment, "claude")
-        claude_netns = exec_netns(claude)
-    if not guard_netns or guard_netns != claude_netns:
-        raise ConfigError(
-            "Claude 与 network-guard 的网络命名空间不一致，已拒绝继续: "
-            f"guard={guard_netns or '<空>'} claude={claude_netns or '<空>'}"
-        )
-    print(f"网络命名空间就绪: network-guard={guard[:12]} {guard_netns}")
+def ensure_stack_healthy(compose: list[str], environment: dict[str, str]) -> None:
+    proxy_id = compose_container_id(compose, environment, "proxy")
+    wait_for_healthy("proxy", proxy_id)
+    claude_id = compose_container_id(compose, environment, "claude")
+    wait_for_healthy("claude", claude_id)
+    print(
+        f"隔离栈就绪: proxy={proxy_id[:12]} (exit={environment['EXPECTED_EXIT_IP']}) "
+        f"claude={claude_id[:12]}"
+    )
 
 
 def assert_no_published_ports(path: Path) -> None:
@@ -781,15 +725,13 @@ def assert_no_published_ports(path: Path) -> None:
 
 def validate_compose(config: AccountConfig) -> None:
     assert_no_published_ports(BASE_COMPOSE)
-    assert_no_published_ports(FAST_SSD_COMPOSE)
-    assert_no_published_ports(TEST_COMPOSE)
     result = run_capture(
         compose_prefix(config) + ["config", "--format", "json"],
         env=config.process_environment(),
     )
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip() or "Docker Compose 无输出"
-        raise ConfigError(f"公共 Compose 与账号配置合并失败: {detail}")
+        raise ConfigError(f"Compose 与账号配置合并失败: {detail}")
     try:
         rendered = json.loads(result.stdout)
     except json.JSONDecodeError as exc:
@@ -820,7 +762,7 @@ def configured_subnets_from_files() -> list[ipaddress._BaseNetwork]:
 
 
 def allocate_locked_subnet() -> ipaddress.IPv4Network:
-    used = [network for _, _, network in docker_networks()]
+    used = [network for _, _, network, _ in docker_networks()]
     used.extend(configured_subnets_from_files())
     for third_octet in range(21, 255):
         candidate = ipaddress.ip_network(f"172.30.{third_octet}.0/24")
@@ -851,7 +793,9 @@ def write_text_exclusive(path: Path, content: str, mode: int) -> None:
 def replace_environment_value(text: str, key: str, value: str | int) -> str:
     pattern = re.compile(rf"^(\s*{re.escape(key)}\s*=)\s*.*$", re.MULTILINE)
     replacement_value = toml_string(str(value))
-    replaced, count = pattern.subn(lambda match: f"{match.group(1)} {replacement_value}", text, count=1)
+    replaced, count = pattern.subn(
+        lambda match: f"{match.group(1)} {replacement_value}", text, count=1
+    )
     if count != 1:
         raise ConfigError(f"模板中找不到字段: {key}")
     return replaced
@@ -910,17 +854,14 @@ def create_account(account: str) -> None:
             f"{target} / {domains_target} / {resolver_target}"
         )
 
-    user, uid, gid, host_home = invoking_user()
-    if not re.fullmatch(r"[a-z_][a-z0-9_-]*", user):
-        raise ConfigError(f"宿主用户名不适合作为容器用户名: {user}")
-    container_home = Path("/home") / user
+    _, uid, gid, host_home = invoking_user()
+    # 默认使用与模板一致的脱敏容器用户名 claude，仅沿用宿主机数值 UID/GID，避免向容器内暴露宿主用户名
+    container_user = "claude"
+    container_home = Path("/home") / container_user
     host_workspace = host_home / "workspace" / "claude-accounts" / account
-    existing_paths = [host_workspace] if host_workspace.exists() else []
-    if existing_paths:
+    if host_workspace.exists():
         raise ConfigError(
-            "拒绝复用已有账号存储目录: "
-            + ", ".join(str(path) for path in existing_paths)
-            + "；请换一个账号名，或先人工核对并处理旧目录"
+            f"拒绝复用已有账号存储目录: {host_workspace}；请换一个账号名，或先人工核对并处理旧目录"
         )
     project = expected_project_name(account)
     resources = existing_project_resources(project)
@@ -948,8 +889,7 @@ def create_account(account: str) -> None:
         "CLAUDE_IMAGE": f"claude-docker-{account}-cpu:local",
         "DOWNLOAD_DOMAIN_SOURCE": f"./accounts/{account}.download-domains.txt",
         "HOST_WORKSPACE": str(host_workspace),
-        "HOST_FAST_SSD": "",
-        "CLAUDE_USER": user,
+        "CLAUDE_USER": container_user,
         "CLAUDE_UID": uid,
         "CLAUDE_GID": gid,
         "CLAUDE_HOME": str(container_home),
@@ -959,13 +899,12 @@ def create_account(account: str) -> None:
         "CLAUDE_NPM_CONFIG_CACHE": str(container_home / "workspace" / ".cache" / "npm"),
         "CLAUDE_PIP_CACHE_DIR": str(container_home / "workspace" / ".cache" / "pip"),
         "CLAUDE_UV_CACHE_DIR": str(container_home / "workspace" / ".cache" / "uv"),
-        "CLAUDE_UV_PYTHON_INSTALL_DIR": str(container_home / "workspace" / ".cache" / "uv" / "python"),
-        "CLAUDE_HF_HOME": str(container_home / "workspace" / ".cache" / "huggingface"),
+        "CLAUDE_UV_PYTHON_INSTALL_DIR": str(
+            container_home / "workspace" / ".cache" / "uv" / "python"
+        ),
         "LOCKED_SUBNET": str(locked),
         "PROXY_IP": str(proxy_ip),
         "CLAUDE_IP": str(claude_ip),
-        "DIRECT_PROXY_LISTEN": str(proxy_ip),
-        "ROUTE_EXCLUDE_CIDRS": str(locked),
     }
     for key, value in updates.items():
         text = replace_environment_value(text, key, value)
@@ -993,7 +932,7 @@ def create_account(account: str) -> None:
     print(f"已创建下载域名表: {domains_target}")
     print(f"已创建只读 DNS resolver 文件: {resolver_target}")
     print(f"已分配内部子网: {locked}")
-    print("下一步：编辑 TOML 中的 PROXY_URI / DOWNLOAD_PROXY_URI 和宿主存储路径，然后运行：")
+    print("下一步：编辑 TOML 中的 PROXY_URI / DOWNLOAD_PROXY_URI / EXPECTED_EXIT_IP，然后运行：")
     print(f"  uv run scripts/account-env.py validate {account}")
     print(f"  uv run scripts/account-env.py up {account}")
 
@@ -1015,30 +954,14 @@ def prepare_directories(config: AccountConfig) -> None:
     gid = int(config.environment["CLAUDE_GID"])
     home = Path(config.environment["CLAUDE_HOME"])
     host_workspace = Path(config.environment["HOST_WORKSPACE"])
-    host_fast_ssd = config.environment["HOST_FAST_SSD"].strip()
-    mounts = {home / "workspace": host_workspace}
+    container_workspace = home / "workspace"
     directories: dict[str, Path] = {"HOST_WORKSPACE": host_workspace}
-    if host_fast_ssd:
-        mounts[home / "md1"] = Path(host_fast_ssd)
-        directories["HOST_FAST_SSD"] = Path(host_fast_ssd)
-    for key in (
-        "CLAUDE_TMPDIR",
-        "CLAUDE_XDG_CACHE_HOME",
-        "CLAUDE_NPM_CONFIG_CACHE",
-        "CLAUDE_PIP_CACHE_DIR",
-        "CLAUDE_UV_CACHE_DIR",
-        "CLAUDE_UV_PYTHON_INSTALL_DIR",
-        "CLAUDE_HF_HOME",
-    ):
+
+    for key in CACHE_CONTAINER_PATH_KEYS:
         container_path = Path(config.environment[key])
-        matched = False
-        for container_root, host_root in mounts.items():
-            if container_path == container_root or container_root in container_path.parents:
-                directories[key] = host_root / container_path.relative_to(container_root)
-                matched = True
-                break
-        if not matched:
+        if container_path != container_workspace and container_workspace not in container_path.parents:
             raise ConfigError(f"{key} 没有对应的宿主机挂载")
+        directories[key] = host_workspace / container_path.relative_to(container_workspace)
 
     for key, path in directories.items():
         path.mkdir(parents=True, exist_ok=True)
@@ -1059,15 +982,180 @@ def print_validation(config: AccountConfig) -> None:
     print(f"Compose 项目: {config.project}")
     print(f"持久卷: {config.project}_claude-home")
     print(f"内部网络: {config.project}_locked ({config.locked_subnet})")
-    print(f"proxy 网关: {environment['PROXY_IP']}")
+    print(f"proxy 网关: {environment['PROXY_IP']} (Xray {environment['XRAY_VERSION']})")
     print(f"Claude 地址: {environment['CLAUDE_IP']}")
-    print(
-        "显式下载代理: "
-        f"{environment['DIRECT_PROXY_LISTEN']}:{environment['DIRECT_PROXY_PORT']}"
-    )
+    print(f"固定出口 IP: {environment['EXPECTED_EXIT_IP']}")
+    print(f"显式下载代理: {environment['PROXY_IP']}:{environment['DIRECT_PROXY_PORT']}")
     print(f"workspace: {environment['HOST_WORKSPACE']}")
-    if environment["HOST_FAST_SSD"].strip():
-        print(f"fast SSD: {environment['HOST_FAST_SSD']}")
+
+
+def list_accounts() -> None:
+    paths = sorted(path for path in ACCOUNTS_DIR.glob("*.toml") if path != TEMPLATE)
+    if not paths:
+        print("当前没有已创建的账号配置。运行 `uv run scripts/account-env.py create <账号>` 创建。")
+        return
+    print(f"{'ACCOUNT':<16} {'SUBNET':<18} {'EXPECTED_EXIT_IP':<18} {'PROXY':<18} {'CLAUDE':<18}")
+    for path in paths:
+        account = path.stem
+        project = expected_project_name(account)
+        subnet = "?"
+        exit_ip = "?"
+        try:
+            with path.open("rb") as handle:
+                env = tomllib.load(handle).get("environment", {})
+                subnet = str(env.get("LOCKED_SUBNET", "?"))
+                exit_ip = str(env.get("EXPECTED_EXIT_IP", "?"))
+        except Exception:
+            pass
+        states = {"proxy": "stopped", "claude": "stopped"}
+        ps_out = run_capture(
+            [
+                "docker",
+                "ps",
+                "-a",
+                "--filter",
+                f"label=com.docker.compose.project={project}",
+                "--format",
+                "{{.Label \"com.docker.compose.service\"}}\t{{.State}}\t{{.Status}}",
+            ]
+        )
+        if ps_out.returncode == 0:
+            for line in ps_out.stdout.splitlines():
+                parts = line.split("\t")
+                if len(parts) >= 3 and parts[0] in states:
+                    health = "healthy" if "(healthy)" in parts[2] else (
+                        "unhealthy" if "(unhealthy)" in parts[2] else parts[1]
+                    )
+                    states[parts[0]] = f"{parts[1]}/{health}" if health != parts[1] else parts[1]
+        print(
+            f"{account:<16} {subnet:<18} {exit_ip:<18} "
+            f"{states['proxy']:<18} {states['claude']:<18}"
+        )
+
+
+def collect_private_account_tokens() -> list[tuple[str, str]]:
+    """Extract sensitive values from private accounts/*.toml without echoing them."""
+    tokens: dict[str, str] = {}
+
+    def register(secret: str, label: str, *, min_len: int = 6) -> None:
+        cleaned = secret.strip()
+        if len(cleaned) < min_len:
+            return
+        if cleaned in {"claude", "example", "example.com", "8.8.8.8", "1.1.1.1", "America/Los_Angeles"}:
+            return
+        tokens.setdefault(cleaned, label)
+
+    for path in sorted(ACCOUNTS_DIR.glob("*.toml")):
+        if path == TEMPLATE:
+            continue
+        try:
+            with path.open("rb") as handle:
+                env = tomllib.load(handle).get("environment", {})
+        except Exception:
+            continue
+        if not isinstance(env, dict):
+            continue
+
+        for uri_key in ("PROXY_URI", "DOWNLOAD_PROXY_URI"):
+            uri = str(env.get(uri_key, "")).strip()
+            if not uri:
+                continue
+            parsed = urlsplit(uri)
+            if parsed.hostname:
+                register(parsed.hostname, f"{uri_key} 服务器 IP", min_len=7)
+            if parsed.username:
+                register(unquote(parsed.username), f"{uri_key} 凭据")
+            query = parse_qs(parsed.query)
+            for param, desc in (("pbk", "Reality 公钥"), ("sid", "Reality sid"), ("spx", "Reality spx")):
+                for item in query.get(param, []):
+                    register(item, f"{uri_key} {desc}")
+
+        exit_ip = str(env.get("EXPECTED_EXIT_IP", "")).strip()
+        if exit_ip:
+            register(exit_ip, "EXPECTED_EXIT_IP", min_len=7)
+
+        allowlist = str(env.get("PRIVATE_TCP_ALLOWLIST", "")).strip()
+        for entry in allowlist.replace(",", " ").split():
+            host = entry.rsplit(":", 1)[0].split("/", 1)[0].strip()
+            register(host, "PRIVATE_TCP_ALLOWLIST 私网地址", min_len=7)
+
+        workspace = str(env.get("HOST_WORKSPACE", "")).strip()
+        if workspace:
+            register(workspace, "HOST_WORKSPACE 宿主路径", min_len=8)
+
+    return sorted(tokens.items(), key=lambda pair: -len(pair[0]))
+
+
+def check_repo_leaks(*, quiet: bool = False) -> None:
+    """Verify example.toml sanitization, .gitignore allowlist, and zero secret leaks in Git files."""
+    load_account("example")
+
+    must_ignore = (
+        "accounts/__probe_private__.toml",
+        "accounts/__probe_private__.toml.bak",
+        "accounts/__probe_private__.key",
+        ".env",
+        ".env.local",
+    )
+    for rel in must_ignore:
+        res = run_capture(["git", "check-ignore", "-q", "--no-index", rel])
+        if res.returncode != 0:
+            raise ConfigError(f".gitignore 未能拦截敏感路径模式: {rel}")
+
+    for tracked_template in ("accounts/example.toml", "accounts/example.resolv.conf"):
+        res = run_capture(["git", "check-ignore", "-q", "--no-index", tracked_template])
+        if res.returncode == 0:
+            raise ConfigError(f"模板文件被 .gitignore 误拦截: {tracked_template}")
+
+    listed = run_capture(["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"])
+    if listed.returncode != 0:
+        raise ConfigError("无法枚举 Git 跟踪与未忽略文件")
+
+    private_tokens = collect_private_account_tokens()
+    findings: list[str] = []
+
+    for raw_rel in listed.stdout.split("\0"):
+        if not raw_rel:
+            continue
+        file_path = ROOT / raw_rel
+        if not file_path.is_file():
+            continue
+        try:
+            lines = file_path.read_text(encoding="utf-8").splitlines()
+        except UnicodeDecodeError:
+            continue
+        except OSError as exc:
+            raise ConfigError(f"无法扫描文件 {raw_rel}: {exc}") from exc
+
+        for lineno, line in enumerate(lines, 1):
+            for secret, label in private_tokens:
+                if secret in line:
+                    findings.append(f"{raw_rel}:{lineno}: 包含私有账号配置中的 {label}")
+                    break
+
+            for uri_match in PROXY_URI_SCAN_RE.finditer(line):
+                uri_val = uri_match.group(0)
+                if raw_rel == "accounts/example.toml" and "uuid@192.0.2." in uri_val:
+                    continue
+                if "://" in uri_val and len(uri_val) > len("vless://") + 3:
+                    # Allow bare scheme mentions such as `vless://` in docs, reject real host/credential URIs
+                    parsed_candidate = urlsplit(uri_val)
+                    if parsed_candidate.hostname and "example.com" not in uri_val and "192.0.2." not in uri_val:
+                        findings.append(f"{raw_rel}:{lineno}: 疑似硬编码真实代理 URI")
+                        break
+
+            if HOST_USERS_PATH_RE.search(line):
+                findings.append(f"{raw_rel}:{lineno}: 硬编码宿主机个人用户路径 (/Users/...)")
+
+    if findings:
+        preview = "\n  - ".join(findings[:10])
+        raise ConfigError(f"仓库防泄漏检查未通过:\n  - {preview}")
+
+    if not quiet:
+        print(
+            f"防泄漏检查通过: example.toml 符合脱敏规范，.gitignore 默认拦截 accounts/*，"
+            f"已扫描受管文件且未发现任何私有凭据/IP/宿主路径泄漏。"
+        )
 
 
 def exec_command(command: list[str], environment: dict[str, str]) -> NoReturn:
@@ -1081,6 +1169,8 @@ def exec_command(command: list[str], environment: dict[str, str]) -> NoReturn:
 
 HELP = f"""\
 用法:
+  uv run scripts/account-env.py list
+  uv run scripts/account-env.py check-leaks
   uv run scripts/account-env.py create <账号>
   uv run scripts/account-env.py validate <账号>
   uv run scripts/account-env.py prepare <账号>
@@ -1093,17 +1183,24 @@ HELP = f"""\
   uv run scripts/account-env.py net-test <账号>
   uv run scripts/account-env.py ps|logs|start|stop|restart|down <账号> [参数...]
   uv run scripts/account-env.py compose <账号> <任意 Compose 子命令...>
-  uv run scripts/account-env.py test-up|test-check|test-fail-closed|test-down <账号> [参数...]
-  uv run scripts/account-env.py test-compose <账号> <任意 Compose 子命令...>
 
 账号配置位置: {ACCOUNTS_DIR}/<账号>.toml
 """
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) < 3 or argv[1] in {"-h", "--help", "help"}:
+    if len(argv) >= 2 and argv[1] in {"-h", "--help", "help"}:
         print(HELP)
-        return 0 if len(argv) >= 2 else 2
+        return 0
+    if len(argv) == 2 and argv[1] == "list":
+        list_accounts()
+        return 0
+    if len(argv) == 2 and argv[1] == "check-leaks":
+        check_repo_leaks()
+        return 0
+    if len(argv) < 3:
+        print(HELP)
+        return 2
 
     action, account, *extra = argv[1:]
     if action == "create":
@@ -1111,14 +1208,14 @@ def main(argv: list[str]) -> int:
             raise ConfigError("create 不接受额外参数")
         create_account(account)
         return 0
+
     config = load_account(account)
     validate_compose(config)
 
     if action == "validate":
         if extra:
             raise ConfigError("validate 不接受额外参数")
-        # The template intentionally keeps placeholder IDs and may reuse a subnet
-        # that is already assigned to a real account. Validate its structure only.
+        check_repo_leaks(quiet=True)
         if account != "example":
             assert_no_network_conflict(config)
         print_validation(config)
@@ -1136,67 +1233,35 @@ def main(argv: list[str]) -> int:
 
     environment = config.process_environment()
     compose = compose_prefix(config)
-    if action.startswith("test-"):
-        test_environment = test_process_environment(config)
-        test_compose = test_compose_prefix(config)
-        if action == "test-up":
-            service_targets = {"proxy", "network-guard", "claude"}.intersection(extra)
-            if service_targets:
-                raise ConfigError(
-                    "test-up 不接受定向服务，避免重建 network-guard 后遗留旧 Claude 命名空间"
-                )
-            if "--no-start" in extra:
-                raise ConfigError("test-up 不支持 --no-start")
-            assert_egress_ignore(test_environment, test=True)
-            build_option = [] if "--no-build" in extra else ["--build"]
-            run_foreground(
-                test_compose + ["up", "-d", *build_option, *extra],
-                env=test_environment,
-            )
-            ensure_network_guard_topology(test_compose, test_environment)
-            return 0
-        if action == "test-down":
-            exec_command(test_compose + ["down", *extra], test_environment)
-        if action == "test-compose":
-            if not extra:
-                raise ConfigError("test-compose 后必须提供 Docker Compose 子命令")
-            exec_command(test_compose + extra, test_environment)
-        if action == "test-check":
-            if extra:
-                raise ConfigError("test-check 不接受额外参数")
-            test_environment["PROXY_IP"] = test_environment.get("TEST_PROXY_IP", "172.30.20.2")
-            test_environment["DIRECT_PROXY_PORT"] = test_environment.get(
-                "TEST_DIRECT_PROXY_PORT", config.environment["DIRECT_PROXY_PORT"]
-            )
-            test_environment["PROXY_ONLY"] = "true"
-            test_environment["EXIT_COUNTRY_DENYLIST"] = ""
-            exec_command([str(ROOT / "scripts" / "check.sh")], test_environment)
-        if action == "test-fail-closed":
-            if extra:
-                raise ConfigError("test-fail-closed 不接受额外参数")
-            exec_command([str(ROOT / "scripts" / "fail-closed-test.sh")], test_environment)
+
     if action == "up":
+        if "--no-start" in extra:
+            raise ConfigError("up 不支持 --no-start")
         assert_no_network_conflict(config)
         assert_egress_ignore(environment)
         prepare_directories(config)
-        service_targets = {"proxy", "network-guard", "claude"}.intersection(extra)
-        if service_targets:
-            raise ConfigError(
-                "up 不接受定向服务，避免重建 network-guard 后遗留旧 Claude 命名空间；"
-                "普通单服务重启请使用 restart"
-            )
-        if "--no-start" in extra:
-            raise ConfigError("up 不支持 --no-start")
+        if needs_topology_migration(config):
+            print("检测到旧版网络拓扑或遗留 sidecar 容器，正在平滑重建隔离网络（保留持久卷）…")
+            run_foreground(compose + ["down", "--remove-orphans"], env=environment)
         build_option = [] if "--no-build" in extra else ["--build"]
-        run_foreground(compose + ["up", "-d", *build_option, *extra], env=environment)
-        ensure_network_guard_topology(compose, environment)
+        run_foreground(
+            compose + ["up", "-d", "--remove-orphans", *build_option, *extra],
+            env=environment,
+        )
+        ensure_stack_healthy(compose, environment)
         return 0
     if action == "shell":
-        exec_command(compose + ["exec", "claude", "zsh", *extra], environment)
+        exec_command(
+            compose + ["exec", "claude", "/usr/local/bin/claude-exec", "/usr/bin/zsh", *extra],
+            environment,
+        )
     if action == "exec":
         if not extra:
             raise ConfigError("exec 后必须提供容器内命令")
-        exec_command(compose + ["exec", "claude", *extra], environment)
+        exec_command(
+            compose + ["exec", "claude", "/usr/local/bin/claude-exec", *extra],
+            environment,
+        )
     if action == "check":
         exec_command([str(ROOT / "scripts" / "check.sh"), *extra], environment)
     if action == "fail-closed":
@@ -1207,19 +1272,10 @@ def main(argv: list[str]) -> int:
         exec_command([str(ROOT / "scripts" / "net-test.sh"), *extra], environment)
     if action in {"start", "restart"}:
         assert_egress_ignore(environment)
-        service_targets = {"proxy", "network-guard", "claude"}.intersection(extra)
         run_foreground(compose + [action, *extra], env=environment)
-        if not service_targets or service_targets.intersection({"network-guard", "claude"}):
-            ensure_network_guard_topology(compose, environment)
+        ensure_stack_healthy(compose, environment)
         return 0
-    if action == "stop":
-        service_targets = {"proxy", "network-guard", "claude"}.intersection(extra)
-        if "network-guard" in service_targets and "claude" not in service_targets:
-            raise ConfigError(
-                "不能在 Claude 运行时单独停止 network-guard；请同时指定 network-guard claude"
-            )
-        exec_command(compose + [action, *extra], environment)
-    if action in {"ps", "logs", "down"}:
+    if action in {"ps", "logs", "stop", "down"}:
         command = [action, *extra]
         if action == "ps" and not extra:
             command.append("-a")

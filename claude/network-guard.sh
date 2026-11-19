@@ -2,7 +2,8 @@
 set -Eeuo pipefail
 
 CHAIN="CLAUDE_EGRESS_GUARD"
-LOCK_FILE="/run/network-guard.lock"
+LOCK_FILE="/run/claude-network-guard.lock"
+GUARD_ENV_FILE="/run/claude-guard.env"
 
 log() {
   printf '%s\n' "$*" >&2
@@ -10,7 +11,7 @@ log() {
 
 on_error() {
   local status=$?
-  log "network guard failed at line $1: $2 (exit=$status)"
+  log "claude network guard failed at line $1: $2 (exit=$status)"
   exit "$status"
 }
 
@@ -18,13 +19,6 @@ trap 'on_error "$LINENO" "$BASH_COMMAND"' ERR
 
 require_env() {
   [[ -n "${!1:-}" ]] || { log "$1 is required"; exit 1; }
-}
-
-proxy_only_enabled() {
-  case "${PROXY_ONLY:-${STRICT_EGRESS:-false}}" in
-    1|true|TRUE|yes|YES|on|ON) return 0 ;;
-    *) return 1 ;;
-  esac
 }
 
 locked_iface() {
@@ -51,8 +45,6 @@ install_ipv6_block() {
 install_ipv4_guard() {
   local iface cidr target allowed_cidr allowed_port
 
-  # Close egress before changing any route or rule. A failed re-apply therefore
-  # degrades to no network instead of exposing Docker's original default route.
   iptables -w -P OUTPUT DROP
   iptables -w -P FORWARD DROP
   iptables -w -F OUTPUT
@@ -63,11 +55,20 @@ install_ipv4_guard() {
 
   iptables -w -N "$CHAIN" 2>/dev/null || true
   iptables -w -F "$CHAIN"
-  iptables -w -A "$CHAIN" -d 127.0.0.11/32 -p udp --dport 53 -j REJECT
-  iptables -w -A "$CHAIN" -d 127.0.0.11/32 -p tcp --dport 53 -j REJECT
+  # Block all ports/protocols to Docker embedded DNS (127.0.0.11) because
+  # nat DOCKER_OUTPUT rewrites dport 53 before filter OUTPUT runs.
+  iptables -w -A "$CHAIN" -d 127.0.0.11/32 -j REJECT
   iptables -w -A "$CHAIN" -o lo -j ACCEPT
-  iptables -w -A "$CHAIN" -o "$iface" -d "$PROXY_IP/32" -j ACCEPT
+  iptables -w -A "$CHAIN" -o "$iface" -d "$PROXY_IP/32" -p udp --dport 53 -j ACCEPT
+  iptables -w -A "$CHAIN" -o "$iface" -d "$PROXY_IP/32" -p tcp --dport 53 -j ACCEPT
+  iptables -w -A "$CHAIN" -o "$iface" -d "$PROXY_IP/32" -p tcp --dport "$DIRECT_PROXY_PORT" -j ACCEPT
   iptables -w -A "$CHAIN" -d "$LOCKED_SUBNET" -j REJECT
+  # Force all DNS through PROXY_IP:53 (--filter-AAAA) and reject client UDP/QUIC
+  # so HTTP/3 falls back immediately to IPv4-pinned TCP 443 and WebRTC STUN fails closed.
+  iptables -w -A "$CHAIN" -p udp --dport 53 -j REJECT
+  iptables -w -A "$CHAIN" -p tcp --dport 53 -j REJECT
+  iptables -w -A "$CHAIN" -p tcp --dport 853 -j REJECT
+  iptables -w -A "$CHAIN" -p udp -j REJECT
 
   for target in ${PRIVATE_TCP_ALLOWLIST//,/ }; do
     allowed_cidr="${target%:*}"
@@ -77,19 +78,19 @@ install_ipv4_guard() {
       log "invalid PRIVATE_TCP_ALLOWLIST item: $target"
       return 1
     fi
+    [[ "$allowed_cidr" == */* ]] || allowed_cidr="$allowed_cidr/32"
     iptables -w -A "$CHAIN" -o "$iface" -d "$allowed_cidr" -p tcp --dport "$allowed_port" -j ACCEPT
   done
 
-  if proxy_only_enabled; then
-    for cidr in ${BLOCK_PRIVATE_CIDRS//,/ }; do
-      [[ -n "$cidr" && "$cidr" != *:* ]] || continue
-      iptables -w -A "$CHAIN" -d "$cidr" -j REJECT
-    done
-    for cidr in 0.0.0.0/8 127.0.0.0/8 224.0.0.0/4 240.0.0.0/4; do
-      iptables -w -A "$CHAIN" -d "$cidr" -j REJECT
-    done
-  fi
-  iptables -w -A "$CHAIN" -o "$iface" -j ACCEPT
+  for cidr in ${BLOCK_PRIVATE_CIDRS//,/ }; do
+    [[ -n "$cidr" && "$cidr" != *:* ]] || continue
+    iptables -w -A "$CHAIN" -d "$cidr" -j REJECT
+  done
+  for cidr in 0.0.0.0/8 127.0.0.0/8 224.0.0.0/4 240.0.0.0/4; do
+    iptables -w -A "$CHAIN" -d "$cidr" -j REJECT
+  done
+
+  iptables -w -A "$CHAIN" -o "$iface" -p tcp -j ACCEPT
   iptables -w -A "$CHAIN" -j REJECT
   iptables -w -A OUTPUT -j "$CHAIN"
 
@@ -134,34 +135,39 @@ verify() {
     return 1
   fi
 
-  iptables -w -C "$CHAIN" -d 127.0.0.11/32 -p udp --dport 53 -j REJECT || return 1
-  iptables -w -C "$CHAIN" -d 127.0.0.11/32 -p tcp --dport 53 -j REJECT || return 1
+  iptables -w -C "$CHAIN" -d 127.0.0.11/32 -j REJECT || return 1
   iptables -w -C "$CHAIN" -o lo -j ACCEPT || return 1
-  iptables -w -C "$CHAIN" -o "$iface" -d "$PROXY_IP/32" -j ACCEPT || return 1
+  iptables -w -C "$CHAIN" -o "$iface" -d "$PROXY_IP/32" -p udp --dport 53 -j ACCEPT || return 1
+  iptables -w -C "$CHAIN" -o "$iface" -d "$PROXY_IP/32" -p tcp --dport 53 -j ACCEPT || return 1
+  iptables -w -C "$CHAIN" -o "$iface" -d "$PROXY_IP/32" -p tcp --dport "$DIRECT_PROXY_PORT" -j ACCEPT || return 1
   iptables -w -C "$CHAIN" -d "$LOCKED_SUBNET" -j REJECT || return 1
+  iptables -w -C "$CHAIN" -p udp --dport 53 -j REJECT || return 1
+  iptables -w -C "$CHAIN" -p tcp --dport 53 -j REJECT || return 1
+  iptables -w -C "$CHAIN" -p tcp --dport 853 -j REJECT || return 1
+  iptables -w -C "$CHAIN" -p udp -j REJECT || return 1
 
-  expected_rules=7
+  expected_rules=12
   for target in ${PRIVATE_TCP_ALLOWLIST//,/ }; do
     allowed_cidr="${target%:*}"
     allowed_port="${target##*:}"
     [[ -n "$allowed_cidr" && "$allowed_cidr" != "$target" && "$allowed_cidr" != *:* ]] || return 1
     [[ "$allowed_port" =~ ^[0-9]+$ && "$allowed_port" -ge 1 && "$allowed_port" -le 65535 ]] || return 1
+    [[ "$allowed_cidr" == */* ]] || allowed_cidr="$allowed_cidr/32"
     iptables -w -C "$CHAIN" -o "$iface" -d "$allowed_cidr" -p tcp --dport "$allowed_port" -j ACCEPT \
       || return 1
     expected_rules=$((expected_rules + 1))
   done
-  if proxy_only_enabled; then
-    for cidr in ${BLOCK_PRIVATE_CIDRS//,/ }; do
-      [[ -n "$cidr" && "$cidr" != *:* ]] || continue
-      iptables -w -C "$CHAIN" -d "$cidr" -j REJECT || return 1
-      expected_rules=$((expected_rules + 1))
-    done
-    for cidr in 0.0.0.0/8 127.0.0.0/8 224.0.0.0/4 240.0.0.0/4; do
-      iptables -w -C "$CHAIN" -d "$cidr" -j REJECT || return 1
-      expected_rules=$((expected_rules + 1))
-    done
-  fi
-  iptables -w -C "$CHAIN" -o "$iface" -j ACCEPT || return 1
+  for cidr in ${BLOCK_PRIVATE_CIDRS//,/ }; do
+    [[ -n "$cidr" && "$cidr" != *:* ]] || continue
+    iptables -w -C "$CHAIN" -d "$cidr" -j REJECT || return 1
+    expected_rules=$((expected_rules + 1))
+  done
+  for cidr in 0.0.0.0/8 127.0.0.0/8 224.0.0.0/4 240.0.0.0/4; do
+    iptables -w -C "$CHAIN" -d "$cidr" -j REJECT || return 1
+    expected_rules=$((expected_rules + 1))
+  done
+
+  iptables -w -C "$CHAIN" -o "$iface" -p tcp -j ACCEPT || return 1
   iptables -w -C "$CHAIN" -j REJECT || return 1
   iptables -w -S "$CHAIN" | tail -1 | grep -q -- "^-A $CHAIN -j REJECT" || return 1
   actual_rules="$(iptables -w -S "$CHAIN" | grep -c "^-A $CHAIN ")"
@@ -169,13 +175,12 @@ verify() {
 }
 
 apply() {
-  # Establish both drop policies before any operation that may fail.
   iptables -w -P OUTPUT DROP
   ip6tables -w -P OUTPUT DROP
   install_ipv6_block
   install_ipv4_guard
   if ! verify; then
-    log "network guard verification failed; current fail-closed state follows"
+    log "claude network guard verification failed; current fail-closed state follows"
     ip -4 route show >&2 || true
     ip -6 address show >&2 || true
     ip -6 route show >&2 || true
@@ -185,52 +190,36 @@ apply() {
   fi
 }
 
-locked_verify() {
-  (
-    flock -x 9
-    verify
-  ) 9>"$LOCK_FILE"
-}
-
-locked_apply() {
-  (
-    flock -x 9
-    apply
-  ) 9>"$LOCK_FILE"
-}
-
 main() {
+  if [[ -z "${PROXY_IP:-}" || -z "${DIRECT_PROXY_PORT:-}" ]] && [[ -r "$GUARD_ENV_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$GUARD_ENV_FILE"
+  fi
   require_env PROXY_IP
+  require_env DIRECT_PROXY_PORT
   require_env LOCKED_SUBNET
   require_env BLOCK_PRIVATE_CIDRS
   PRIVATE_TCP_ALLOWLIST="${PRIVATE_TCP_ALLOWLIST:-}"
 
-  case "${1:-run}" in
+  case "${1:-check}" in
     check)
-      locked_verify
-      exit
+      (
+        flock -x 9
+        verify
+      ) 9>"$LOCK_FILE"
       ;;
     apply)
-      locked_apply
-      log "network guard policy re-applied"
-      exit
+      (
+        flock -x 9
+        apply
+      ) 9>"$LOCK_FILE"
+      log "claude network guard active: default via $PROXY_IP, IPv6/UDP/127.0.0.11 blocked"
       ;;
-    run) ;;
     *)
-      log "usage: network-guard.sh [run|check|apply]"
+      log "usage: claude-network-guard.sh [apply|check]"
       exit 2
       ;;
   esac
-
-  locked_apply
-  log "network guard active: default via $PROXY_IP, IPv6 disabled, proxy_only=${PROXY_ONLY:-${STRICT_EGRESS:-false}}"
-  trap 'exit 0' TERM INT
-  while sleep 2; do
-    if ! locked_verify; then
-      log "network guard drift detected; re-applying fail-closed policy"
-      locked_apply
-    fi
-  done
 }
 
 main "$@"

@@ -11,12 +11,17 @@ EOF
   exit 2
 fi
 
-PROBE_URL="${FAIL_CLOSED_PROBE_URL:-https://api.ipify.org}"
+PROBE_URL="${FAIL_CLOSED_PROBE_URL:-${EXIT_CHECK_URL:-https://www.cloudflare.com/cdn-cgi/trace}}"
+EXPECTED_IP="${EXPECTED_EXIT_IP:-}"
 CHAIN="CLAUDE_FAIL_CLOSED_TEST"
 CHAIN_INSTALLED=0
 
 compose_exec() {
   docker compose exec -T "$@"
+}
+
+claude_exec() {
+  docker compose exec -T claude /usr/local/bin/claude-exec "$@"
 }
 
 cleanup() {
@@ -41,7 +46,7 @@ container_state="$(docker compose ps --format '{{.Service}} {{.State}}' | awk '$
 }
 
 echo "Checking normal tunnel connectivity..."
-compose_exec claude bash -lc 'curl -fsS --connect-timeout 5 --max-time 20 "$1" >/dev/null' bash "$PROBE_URL"
+claude_exec bash -lc 'curl -fsS --connect-timeout 5 --max-time 20 "$1" >/dev/null' bash "$PROBE_URL"
 
 echo "Blocking configured upstream endpoints..."
 CHAIN_INSTALLED=1
@@ -53,41 +58,32 @@ iptables -w -F "$chain"
 
 python3 - <<'PY' | while read -r server port; do
 import json
-import os
 
-with open("/etc/sing-box/config.json", encoding="utf-8") as fh:
+with open("/etc/xray/config.json", encoding="utf-8") as fh:
     config = json.load(fh)
-xray_upstreams = {}
-if os.path.exists("/etc/xray/config.json"):
-    with open("/etc/xray/config.json", encoding="utf-8") as xfh:
-        xray_config = json.load(xfh)
-    for xout in xray_config.get("outbounds", []):
-        vnext = (xout.get("settings") or {}).get("vnext") or []
-        if xout.get("tag") and vnext:
-            xray_upstreams[xout["tag"]] = (vnext[0].get("address"), vnext[0].get("port"))
+
 seen = set()
-for outbound in config["outbounds"]:
-    tag = outbound.get("tag")
-    server = outbound.get("server")
-    port = outbound.get("server_port")
-    if tag in xray_upstreams:
-        server, port = xray_upstreams[tag]
-    if server and port and (server, port) not in seen:
-        seen.add((server, port))
-        print(f"{server}\t{port}")
+for out in config.get("outbounds", []):
+    proto = out.get("protocol", "")
+    settings = out.get("settings") or {}
+    if proto == "vless":
+        for item in settings.get("vnext") or []:
+            addr, port = item.get("address"), item.get("port")
+            if addr and port and (addr, port) not in seen:
+                seen.add((addr, port))
+                print(f"{addr}\t{port}")
+    elif proto in ("trojan", "shadowsocks"):
+        for item in settings.get("servers") or []:
+            addr, port = item.get("address"), item.get("port")
+            if addr and port and (addr, port) not in seen:
+                seen.add((addr, port))
+                print(f"{addr}\t{port}")
 PY
-  if printf '%s' "$server" | grep -Eq '^[0-9]+(\.[0-9]+){3}$'; then
-    ips="$server"
-  else
-    ips="$(getent ahostsv4 "$server" | awk '{ print $1 }' | sort -u)"
-  fi
-  [ -n "$ips" ] || { echo "failed to resolve an upstream" >&2; exit 1; }
-  for ip in $ips; do
-    iface="$(ip route get "$ip" | awk '{ for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit } }')"
-    [ -n "$iface" ] || { echo "failed to find upstream route" >&2; exit 1; }
-    iptables -w -A "$chain" -o "$iface" -p tcp -d "$ip" --dport "$port" -j REJECT
-    iptables -w -A "$chain" -o "$iface" -p udp -d "$ip" --dport "$port" -j REJECT
-  done
+  [ -n "$server" ] || continue
+  iface="$(ip -4 route get "$server" mark 0xff | awk '{ for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit } }')"
+  [ -n "$iface" ] || { echo "failed to find upstream route for $server" >&2; exit 1; }
+  iptables -w -A "$chain" -o "$iface" -p tcp -d "$server" --dport "$port" -j REJECT
+  iptables -w -A "$chain" -o "$iface" -p udp -d "$server" --dport "$port" -j REJECT
 done
 
 iptables -w -S "$chain" | grep -q -- '-j REJECT'
@@ -96,7 +92,7 @@ SH
 
 sleep 2
 echo "Verifying that client traffic fails instead of falling back to direct egress..."
-if compose_exec claude bash -lc 'curl -fsS --connect-timeout 4 --max-time 10 "$1" >/dev/null' bash "$PROBE_URL"; then
+if claude_exec bash -lc 'curl -fsS --connect-timeout 4 --max-time 10 "$1" >/dev/null' bash "$PROBE_URL"; then
   echo "SECURITY FAILURE: traffic succeeded while every upstream endpoint was blocked" >&2
   exit 1
 fi
@@ -118,16 +114,20 @@ trap - EXIT INT TERM
 
 echo "Restoring and checking tunnel connectivity..."
 recovered=0
+recovered_ip=""
 for _ in $(seq 1 15); do
-  if compose_exec claude bash -lc 'curl -fsS --connect-timeout 3 --max-time 8 "$1" >/dev/null' bash "$PROBE_URL"; then
-    recovered=1
-    break
+  if trace="$(claude_exec bash -lc 'curl -fsS --connect-timeout 3 --max-time 8 "$1"' bash "$PROBE_URL" 2>/dev/null)"; then
+    recovered_ip="$(awk -F= '$1 == "ip" { gsub(/[[:space:]]/, "", $2); print $2; exit }' <<<"$trace")"
+    if [[ -z "$EXPECTED_IP" || "$recovered_ip" == "$EXPECTED_IP" ]]; then
+      recovered=1
+      break
+    fi
   fi
   sleep 2
 done
 [[ "$recovered" == "1" ]] || {
-  echo "upstream did not recover after removing the test block" >&2
+  echo "upstream did not recover with expected exit IP ($EXPECTED_IP) after removing block" >&2
   exit 1
 }
 
-echo "✓ Fail-closed outage test passed"
+echo "✓ Fail-closed outage test passed (exit IP: ${recovered_ip:-verified})"

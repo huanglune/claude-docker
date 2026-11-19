@@ -9,15 +9,12 @@ export GITSTATUS_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/gitstatus"
 mkdir -p "$ZSH_CACHE_DIR" "$GITSTATUS_CACHE_DIR"
 ZSH_THEME="powerlevel10k/powerlevel10k"
 zstyle ':omz:update' mode disabled
-# Mirrors the host ~/.zshrc plugin list. `macos` and `brew` are macOS/Homebrew
-# oriented: they load cleanly on Linux and simply define no-ops there.
+
 plugins=(
   git
   z
   sudo
   extract
-  macos
-  brew
   zsh-autosuggestions
   zsh-syntax-highlighting
 )
