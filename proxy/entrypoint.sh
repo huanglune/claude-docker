@@ -2,8 +2,10 @@
 set -euo pipefail
 
 CONFIG_PATH="${SINGBOX_CONFIG_PATH:-/etc/sing-box/config.json}"
+XRAY_CONFIG_PATH="${XRAY_CONFIG_PATH:-/etc/xray/config.json}"
 DNSMASQ_PID=""
 SINGBOX_PID=""
+XRAY_PID=""
 WATCHDOG_PID=""
 ENTRYPOINT_PID="$$"
 ORIGINAL_RESOLV_CONF=""
@@ -106,10 +108,26 @@ sync_timezone() {
   fi
 }
 
+xray_needed() {
+  python3 - "$XRAY_CONFIG_PATH" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as fh:
+    config = json.load(fh)
+raise SystemExit(0 if config.get("inbounds") else 1)
+PY
+}
+
 render_singbox_config() {
-  mkdir -p "$(dirname "$CONFIG_PATH")"
+  mkdir -p "$(dirname "$CONFIG_PATH")" "$(dirname "$XRAY_CONFIG_PATH")"
   python3 /usr/local/bin/generate-singbox.py > "$CONFIG_PATH"
   sing-box check -c "$CONFIG_PATH" >/dev/null
+  python3 /usr/local/bin/generate-singbox.py --xray > "$XRAY_CONFIG_PATH"
+  if xray_needed; then
+    require_command xray
+    xray run -test -config "$XRAY_CONFIG_PATH" >/dev/null
+  fi
 }
 
 iptables_append_once() {
@@ -456,6 +474,19 @@ restore_bootstrap_resolver() {
   fi
 }
 
+start_xray() {
+  if ! xray_needed; then
+    return 0
+  fi
+  xray run -c "$XRAY_CONFIG_PATH" &
+  XRAY_PID="$!"
+  sleep 0.2
+  if ! kill -0 "$XRAY_PID" 2>/dev/null; then
+    log "xray failed to start"
+    exit 1
+  fi
+}
+
 start_singbox() {
   sing-box run -c "$CONFIG_PATH" &
   SINGBOX_PID="$!"
@@ -561,6 +592,10 @@ cleanup() {
     kill "$SINGBOX_PID" 2>/dev/null || true
     wait "$SINGBOX_PID" 2>/dev/null || true
   fi
+  if [[ -n "$XRAY_PID" ]]; then
+    kill "$XRAY_PID" 2>/dev/null || true
+    wait "$XRAY_PID" 2>/dev/null || true
+  fi
   if [[ -n "$DNSMASQ_PID" ]]; then
     kill "$DNSMASQ_PID" 2>/dev/null || true
     wait "$DNSMASQ_PID" 2>/dev/null || true
@@ -599,10 +634,11 @@ main() {
   ORIGINAL_RESOLV_CONF="$(cat /etc/resolv.conf)"
   validate_security_policy
   sync_timezone
-  render_singbox_config
   install_forward_firewall
   install_output_kill_switch
+  render_singbox_config
   start_dns_forwarder
+  start_xray
   start_singbox
   install_local_redirect_bypass
   use_tunnel_dns_only
@@ -611,6 +647,9 @@ main() {
   release_client_guard
 
   local -a supervised_pids=("$SINGBOX_PID" "$DNSMASQ_PID")
+  if [[ -n "$XRAY_PID" ]]; then
+    supervised_pids+=("$XRAY_PID")
+  fi
   if [[ -n "$WATCHDOG_PID" ]]; then
     supervised_pids+=("$WATCHDOG_PID")
   fi
