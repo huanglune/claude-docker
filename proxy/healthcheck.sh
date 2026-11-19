@@ -30,6 +30,7 @@ lock_down_on_drift() {
     iptables -w -N CLAUDE_CLIENT_GUARD 2>/dev/null || true
     iptables -w -F CLAUDE_CLIENT_GUARD
     iptables -w -A CLAUDE_CLIENT_GUARD -i "$locked_if" -s "$LOCKED_SUBNET" -j REJECT
+    iptables -w -A CLAUDE_CLIENT_GUARD -i lo -d 127.0.0.1/32 -p tcp --dport 10800 -j REJECT
     iptables -w -C INPUT -j CLAUDE_CLIENT_GUARD 2>/dev/null || iptables -w -I INPUT 1 -j CLAUDE_CLIENT_GUARD
     iptables -w -C FORWARD -j CLAUDE_CLIENT_GUARD 2>/dev/null || iptables -w -I FORWARD 1 -j CLAUDE_CLIENT_GUARD
   fi

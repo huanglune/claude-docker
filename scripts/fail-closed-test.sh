@@ -96,6 +96,10 @@ if claude_exec bash -lc 'curl -fsS --connect-timeout 4 --max-time 10 "$1" >/dev/
   echo "SECURITY FAILURE: traffic succeeded while every upstream endpoint was blocked" >&2
   exit 1
 fi
+if compose_exec proxy sh -lc 'curl -fsS --connect-timeout 4 --max-time 10 --socks5-hostname 127.0.0.1:10800 "$1" >/dev/null' sh "$PROBE_URL"; then
+  echo "SECURITY FAILURE: browser loopback proxy succeeded while every upstream endpoint was blocked" >&2
+  exit 1
+fi
 
 blocked_packets="$(compose_exec proxy sh -s -- "$CHAIN" <<'SH'
 chain="$1"

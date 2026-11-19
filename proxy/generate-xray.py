@@ -12,6 +12,8 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 
 FWMARK = 255
+BROWSER_PROXY_LISTEN = "127.0.0.1"
+BROWSER_PROXY_PORT = 10800
 BOGON_CIDRS = (
     "0.0.0.0/8",
     "127.0.0.0/8",
@@ -453,6 +455,14 @@ def build_config(proxy: ProxyConfig, download_proxy: ProxyConfig, runtime: Runti
             "settings": {"udp": False},
             "sniffing": sniffing,
         },
+        {
+            "tag": "browser-proxy-in",
+            "listen": BROWSER_PROXY_LISTEN,
+            "port": BROWSER_PROXY_PORT,
+            "protocol": "mixed",
+            "settings": {"udp": False},
+            "sniffing": sniffing,
+        },
     ]
 
     outbounds = [
@@ -471,12 +481,33 @@ def build_config(proxy: ProxyConfig, download_proxy: ProxyConfig, runtime: Runti
         },
     ]
 
+    blocked_cidrs = dedupe(runtime.private_cidrs + list(BOGON_CIDRS) + [runtime.locked_subnet])
     rules: list[dict] = [
         {
             "type": "field",
             "inboundTag": ["xray-dns"],
             "outboundTag": "proxy-upstream",
-        }
+        },
+        # Host controlled browser inbound: never reach PRIVATE_TCP_ALLOWLIST, private CIDRs,
+        # loopback, or local-only hostnames, and never split onto DOWNLOAD_PROXY_URI.
+        {
+            "type": "field",
+            "inboundTag": ["browser-proxy-in"],
+            "ip": blocked_cidrs,
+            "outboundTag": "block",
+        },
+        {
+            "type": "field",
+            "inboundTag": ["browser-proxy-in"],
+            "domain": [
+                "full:localhost",
+                "domain:localhost",
+                "domain:local",
+                "domain:internal",
+                "domain:home.arpa",
+            ],
+            "outboundTag": "block",
+        },
     ]
     for target in runtime.private_tcp_allowlist:
         rules.append(
@@ -489,7 +520,6 @@ def build_config(proxy: ProxyConfig, download_proxy: ProxyConfig, runtime: Runti
             }
         )
 
-    blocked_cidrs = dedupe(runtime.private_cidrs + list(BOGON_CIDRS) + [runtime.locked_subnet])
     rules.append(
         {
             "type": "field",
@@ -500,6 +530,14 @@ def build_config(proxy: ProxyConfig, download_proxy: ProxyConfig, runtime: Runti
 
     # Allow proxy's own dnsmasq queries to DNS_SERVER:53 through the encrypted tunnel,
     # and block all other UDP (QUIC/WebRTC/DoQ) so exit traffic stays strictly IPv4-pinned TCP.
+    rules.append(
+        {
+            "type": "field",
+            "inboundTag": ["browser-proxy-in"],
+            "network": "udp",
+            "outboundTag": "block",
+        }
+    )
     rules.append(
         {
             "type": "field",
@@ -517,6 +555,14 @@ def build_config(proxy: ProxyConfig, download_proxy: ProxyConfig, runtime: Runti
         }
     )
 
+    rules.append(
+        {
+            "type": "field",
+            "inboundTag": ["browser-proxy-in"],
+            "network": "tcp",
+            "outboundTag": "proxy",
+        }
+    )
     rules.append(
         {
             "type": "field",
