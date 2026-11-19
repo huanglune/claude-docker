@@ -194,6 +194,7 @@ activate_client_guard() {
   iptables -w -N "$chain" 2>/dev/null || true
   iptables -w -F "$chain"
   iptables -w -A "$chain" -i "$locked_if" -s "$LOCKED_SUBNET" -j REJECT
+  iptables -w -A "$chain" -i lo -d 127.0.0.1/32 -p tcp --dport 10800 -j REJECT
   iptables -w -C INPUT -j "$chain" 2>/dev/null || iptables -w -I INPUT 1 -j "$chain"
   iptables -w -C FORWARD -j "$chain" 2>/dev/null || iptables -w -I FORWARD 1 -j "$chain"
 }

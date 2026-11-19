@@ -1167,6 +1167,63 @@ def exec_command(command: list[str], environment: dict[str, str]) -> NoReturn:
         die(f"找不到命令: {command[0]}")
 
 
+def launch_browser(
+    config: AccountConfig,
+    compose: list[str],
+    environment: dict[str, str],
+    extra: list[str],
+) -> None:
+    if os.geteuid() == 0:
+        raise ConfigError("不要以 root 启动受控浏览器；请使用普通宿主桌面用户运行")
+
+    scripts_dir = str(Path(__file__).resolve().parent)
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    from controlled_browser import BrowserError, run_controlled_browser
+
+    _, uid, _, host_home = invoking_user()
+    assert_egress_ignore(environment)
+
+    proxy_id = compose_container_id(compose, environment, "proxy")
+    claude_id = compose_container_id(compose, environment, "claude")
+    for svc, cid in (("proxy", proxy_id), ("claude", claude_id)):
+        state = inspect_value(
+            cid,
+            "{{.State.Status}}/{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}",
+        )
+        if state != "running/healthy":
+            raise ConfigError(
+                f"{svc} 容器当前未就绪 ({state})；请先运行 `uv run scripts/account-env.py up {config.account}`"
+            )
+
+    def is_healthy(container: str) -> bool:
+        res = run_capture(
+            [
+                "docker",
+                "inspect",
+                "-f",
+                "{{.State.Status}}/{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}",
+                container,
+            ]
+        )
+        return res.returncode == 0 and res.stdout.strip() == "running/healthy"
+
+    try:
+        run_controlled_browser(
+            account=config.account,
+            environment=environment,
+            locked_subnet=config.locked_subnet,
+            proxy_container=proxy_id,
+            claude_container=claude_id,
+            uid=uid,
+            host_home=host_home,
+            check_container_healthy=is_healthy,
+            extra_args=extra,
+        )
+    except BrowserError as exc:
+        raise ConfigError(str(exc)) from exc
+
+
 HELP = f"""\
 用法:
   uv run scripts/account-env.py list
@@ -1177,6 +1234,7 @@ HELP = f"""\
   uv run scripts/account-env.py up <账号> [Compose up 参数...]
   uv run scripts/account-env.py shell <账号>
   uv run scripts/account-env.py exec <账号> <命令...>
+  uv run scripts/account-env.py browser <账号> [--check-only] [--oauth-port <端口>] [--no-claude-localhost] [--reset-profile] [URL]
   uv run scripts/account-env.py check <账号>
   uv run scripts/account-env.py fail-closed <账号>
   uv run scripts/account-env.py repair-network <账号>
@@ -1262,6 +1320,9 @@ def main(argv: list[str]) -> int:
             compose + ["exec", "claude", "/usr/local/bin/claude-exec", *extra],
             environment,
         )
+    if action == "browser":
+        launch_browser(config, compose, environment, extra)
+        return 0
     if action == "check":
         exec_command([str(ROOT / "scripts" / "check.sh"), *extra], environment)
     if action == "fail-closed":

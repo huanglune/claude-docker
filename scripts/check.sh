@@ -289,6 +289,11 @@ if not direct_in or direct_in.get("listen") in {None, "", "0.0.0.0", "::", "::0"
     raise SystemExit("download-proxy-in must listen on a specific IPv4 address")
 if (direct_in.get("settings") or {}).get("udp") is not False:
     raise SystemExit("download-proxy-in must disable UDP")
+browser_in = inbounds.get("browser-proxy-in")
+if not browser_in or browser_in.get("listen") != "127.0.0.1" or browser_in.get("port") != 10800:
+    raise SystemExit("browser-proxy-in must listen strictly on 127.0.0.1:10800")
+if (browser_in.get("settings") or {}).get("udp") is not False:
+    raise SystemExit("browser-proxy-in must disable UDP")
 
 expected_private = set()
 for item in os.environ.get("PRIVATE_TCP_ALLOWLIST", "").replace(",", " ").split():
@@ -299,18 +304,34 @@ for item in os.environ.get("PRIVATE_TCP_ALLOWLIST", "").replace(",", " ").split(
 
 actual_private = set()
 download_domains = 0
+saw_browser_ip_block = False
+saw_private_direct = False
+saw_browser_tcp_proxy = False
 for rule in (config.get("routing") or {}).get("rules", []):
     out_tag = rule.get("outboundTag")
-    if out_tag == "private-direct":
+    in_tags = rule.get("inboundTag") or []
+    if out_tag == "block" and in_tags == ["browser-proxy-in"] and rule.get("ip"):
+        if saw_private_direct:
+            raise SystemExit("browser-proxy-in IP block must precede private-direct rules")
+        saw_browser_ip_block = True
+    elif out_tag == "private-direct":
+        saw_private_direct = True
         ips = rule.get("ip") or []
         if len(ips) != 1 or rule.get("network") != "tcp":
             raise SystemExit(f"unexpected private-direct rule: {rule}")
         actual_private.add((ips[0], str(rule.get("port"))))
+    elif out_tag == "proxy" and in_tags == ["browser-proxy-in"] and rule.get("network") == "tcp":
+        if download_domains > 0:
+            raise SystemExit("browser-proxy-in TCP->proxy rule must precede download domain split rules")
+        saw_browser_tcp_proxy = True
     elif out_tag == "download" and rule.get("domain"):
         download_domains += len(rule["domain"])
     elif out_tag == "block" and rule.get("domain"):
-        raise SystemExit("domain-based block rule is prohibited")
+        if in_tags != ["browser-proxy-in"]:
+            raise SystemExit("domain-based block rule is only allowed on browser-proxy-in")
 
+if not saw_browser_ip_block or not saw_browser_tcp_proxy:
+    raise SystemExit("missing strict browser-proxy-in isolation rules")
 if actual_private != expected_private:
     raise SystemExit(f"private allowlist mismatch: expected={sorted(expected_private)} actual={sorted(actual_private)}")
 if download_domains == 0:
@@ -319,6 +340,7 @@ if download_domains == 0:
 print(
     f"download_domains={download_domains} "
     f"manual_proxy={direct_in.get('listen')}:{direct_in.get('port')} "
+    f"browser_loopback={browser_in.get('listen')}:{browser_in.get('port')} "
     f"private_allow={len(actual_private)} ipv4_pinned=UseIPv4+fragment"
 )
 PY
@@ -398,6 +420,36 @@ if [[ "$direct_proxy_trace" == "$EXPECTED_EXIT_IP" ]]; then
   ok "manual download proxy port (IPv4 pinned)" "$PROXY_IP:$DIRECT_PROXY_PORT -> $direct_proxy_trace"
 else
   die "manual download proxy port (IPv4 pinned)" "expected=$EXPECTED_EXIT_IP actual=$direct_proxy_trace"
+fi
+
+browser_proxy_trace="$(compose_exec proxy sh -lc '
+  set -eu
+  if curl -fsS --connect-timeout 2 --max-time 4 --socks5-hostname 127.0.0.1:10800 http://10.0.0.1 >/dev/null 2>&1; then
+    echo "private CIDR unexpectedly reachable via browser-proxy-in" >&2
+    exit 1
+  fi
+  if curl -fsS --connect-timeout 2 --max-time 4 --socks5-hostname 127.0.0.1:10800 http://localhost >/dev/null 2>&1; then
+    echo "localhost unexpectedly reachable via browser-proxy-in" >&2
+    exit 1
+  fi
+  first_private="$(printf "%s" "${PRIVATE_TCP_ALLOWLIST:-}" | tr "," " " | awk "{ print \$1 }")"
+  if [ -n "$first_private" ]; then
+    priv_host="${first_private%:*}"
+    priv_host="${priv_host%/*}"
+    priv_port="${first_private##*:}"
+    if curl -fsS --connect-timeout 2 --max-time 4 --socks5-hostname 127.0.0.1:10800 "http://$priv_host:$priv_port" >/dev/null 2>&1; then
+      echo "PRIVATE_TCP_ALLOWLIST target $priv_host:$priv_port unexpectedly reachable via browser-proxy-in" >&2
+      exit 1
+    fi
+  fi
+  curl -fsS --max-time 20 --socks5-hostname 127.0.0.1:10800 "$1" \
+    | awk -F= '\''$1 == "ip" { gsub(/[[:space:]]/, "", $2); print $2; exit }'\''
+' sh "$EXIT_CHECK_URL_VALUE" 2>&1)" \
+  || die "controlled browser loopback proxy" "$browser_proxy_trace"
+if [[ "$browser_proxy_trace" == "$EXPECTED_EXIT_IP" ]]; then
+  ok "controlled browser loopback proxy (IPv4 & LAN-isolated)" "127.0.0.1:10800 -> $browser_proxy_trace"
+else
+  die "controlled browser loopback proxy (IPv4 & LAN-isolated)" "expected=$EXPECTED_EXIT_IP actual=$browser_proxy_trace"
 fi
 
 section "Claude Network & Pinned Exit IP"
