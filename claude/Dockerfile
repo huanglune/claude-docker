@@ -67,6 +67,8 @@ RUN set -eux; \
       /usr/local/share/oh-my-zsh/custom/plugins/zsh-autosuggestions; \
     git clone --depth=1 https://github.com/zsh-users/zsh-syntax-highlighting.git \
       /usr/local/share/oh-my-zsh/custom/plugins/zsh-syntax-highlighting; \
+    git clone --depth=1 https://github.com/MichaelAquilina/zsh-you-should-use.git \
+      /usr/local/share/oh-my-zsh/custom/plugins/you-should-use; \
     GITSTATUS_CACHE_DIR=/usr/local/share/oh-my-zsh/custom/themes/powerlevel10k/gitstatus/usrbin \
       /usr/local/share/oh-my-zsh/custom/themes/powerlevel10k/gitstatus/install; \
     chmod -R a+rX /usr/local/share/oh-my-zsh
