@@ -1,5 +1,36 @@
 # CPU image. Claude Code runs on generic Ubuntu LTS and does not request a GPU.
 ARG BASE_IMAGE=ubuntu:24.04
+
+# Build tmux from source; Ubuntu 24.04 only ships tmux 3.4.
+FROM ${BASE_IMAGE} AS tmux-build
+ARG TMUX_VERSION=3.7b
+RUN set -eux; \
+    if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then \
+      sed -i \
+        -e 's|http://archive.ubuntu.com/ubuntu|http://mirrors.aliyun.com/ubuntu|g' \
+        -e 's|http://security.ubuntu.com/ubuntu|http://mirrors.aliyun.com/ubuntu|g' \
+        -e 's|http://ports.ubuntu.com/ubuntu-ports|http://mirrors.aliyun.com/ubuntu-ports|g' \
+        /etc/apt/sources.list.d/ubuntu.sources; \
+    else \
+      sed -i \
+        -e 's|http://archive.ubuntu.com/ubuntu|http://mirrors.aliyun.com/ubuntu|g' \
+        -e 's|http://security.ubuntu.com/ubuntu|http://mirrors.aliyun.com/ubuntu|g' \
+        -e 's|http://ports.ubuntu.com/ubuntu-ports|http://mirrors.aliyun.com/ubuntu-ports|g' \
+        /etc/apt/sources.list; \
+    fi; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+      bison build-essential ca-certificates curl libevent-dev libncurses-dev pkg-config; \
+    curl -fsSL "https://gh-proxy.org/https://github.com/tmux/tmux/releases/download/${TMUX_VERSION}/tmux-${TMUX_VERSION}.tar.gz" \
+      -o /tmp/tmux.tar.gz; \
+    mkdir -p /tmp/tmux-src; \
+    tar -xzf /tmp/tmux.tar.gz -C /tmp/tmux-src --strip-components=1; \
+    cd /tmp/tmux-src; \
+    ./configure --prefix=/usr/local; \
+    make -j"$(nproc)"; \
+    make install; \
+    tmux -V
+
 FROM ${BASE_IMAGE}
 
 ARG CLAUDE_USER=claude
@@ -30,14 +61,16 @@ RUN set -eux; \
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
-      ca-certificates curl git gnupg iproute2 iptables less locales \
-      openssh-client procps python3 sudo tini tzdata util-linux wget zsh; \
+      ca-certificates curl git gnupg iproute2 iptables less libevent-core-2.1-7t64 \
+      locales openssh-client procps python3 sudo tini tzdata util-linux wget zsh; \
     rm -rf /var/lib/apt/lists/*; \
     sed -i 's/^# *en_US.UTF-8/en_US.UTF-8/' /etc/locale.gen; \
     locale-gen; \
     test -f "/usr/share/zoneinfo/${CONTAINER_TZ}"; \
     ln -snf "/usr/share/zoneinfo/${CONTAINER_TZ}" /etc/localtime; \
     echo "${CONTAINER_TZ}" > /etc/timezone
+
+COPY --from=tmux-build /usr/local/bin/tmux /usr/local/bin/tmux
 
 RUN set -eux; \
     if [ -n "${CLAUDE_EXTRA_APT_PACKAGES}" ]; then \
@@ -56,19 +89,21 @@ RUN set -eux; \
     npm cache clean --force
 
 RUN set -eux; \
-    curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh; \
+    curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin UV_INSTALLER_GITHUB_BASE_URL="https://gh-proxy.org/https://github.com" sh; \
     uv --version
 
 RUN set -eux; \
-    git clone --depth=1 https://github.com/ohmyzsh/ohmyzsh.git /usr/local/share/oh-my-zsh; \
-    git clone --depth=1 https://github.com/romkatv/powerlevel10k.git \
+    git clone --depth=1 https://gh-proxy.org/https://github.com/ohmyzsh/ohmyzsh.git /usr/local/share/oh-my-zsh; \
+    git clone --depth=1 https://gh-proxy.org/https://github.com/romkatv/powerlevel10k.git \
       /usr/local/share/oh-my-zsh/custom/themes/powerlevel10k; \
-    git clone --depth=1 https://github.com/zsh-users/zsh-autosuggestions.git \
+    git clone --depth=1 https://gh-proxy.org/https://github.com/zsh-users/zsh-autosuggestions.git \
       /usr/local/share/oh-my-zsh/custom/plugins/zsh-autosuggestions; \
-    git clone --depth=1 https://github.com/zsh-users/zsh-syntax-highlighting.git \
+    git clone --depth=1 https://gh-proxy.org/https://github.com/zsh-users/zsh-syntax-highlighting.git \
       /usr/local/share/oh-my-zsh/custom/plugins/zsh-syntax-highlighting; \
-    git clone --depth=1 https://github.com/MichaelAquilina/zsh-you-should-use.git \
+    git clone --depth=1 https://gh-proxy.org/https://github.com/MichaelAquilina/zsh-you-should-use.git \
       /usr/local/share/oh-my-zsh/custom/plugins/you-should-use; \
+    sed -i 's|https://github.com/romkatv/gitstatus/releases/download|https://gh-proxy.org/https://github.com/romkatv/gitstatus/releases/download|' \
+      /usr/local/share/oh-my-zsh/custom/themes/powerlevel10k/gitstatus/install; \
     GITSTATUS_CACHE_DIR=/usr/local/share/oh-my-zsh/custom/themes/powerlevel10k/gitstatus/usrbin \
       /usr/local/share/oh-my-zsh/custom/themes/powerlevel10k/gitstatus/install; \
     chmod -R a+rX /usr/local/share/oh-my-zsh
