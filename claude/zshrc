@@ -17,8 +17,16 @@ plugins=(
   extract
   zsh-autosuggestions
   zsh-syntax-highlighting
+  you-should-use
 )
 source "$ZSH/oh-my-zsh.sh"
+
+# Accept the inline suggestion with Ctrl+/
+bindkey '^_' autosuggest-accept
+# Prefer shell history, then completion, when suggesting
+export ZSH_AUTOSUGGEST_STRATEGY=(history completion)
+# Show you-should-use reminders after command output
+export YSU_MESSAGE_POSITION='after'
 
 # Absent ~/.p10k.zsh makes the next interactive shell run `p10k configure`.
 [[ ! -f ~/.p10k.zsh ]] || source ~/.p10k.zsh
