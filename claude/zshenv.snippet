@@ -1,4 +1,11 @@
-# Give a new home the image zshrc before zsh-newuser-install runs.
-if [[ -o interactive && ! -e ${ZDOTDIR:-$HOME}/.zshrc && -r /etc/skel/.zshrc ]]; then
-  cp /etc/skel/.zshrc ${ZDOTDIR:-$HOME}/.zshrc
+# Give a new home the image zshrc before zsh-newuser-install runs, and upgrade
+# existing homes created before the image added the Ctrl+/ autosuggest binding.
+if [[ -o interactive && -r /etc/skel/.zshrc ]]; then
+  if [[ ! -e ${ZDOTDIR:-$HOME}/.zshrc ]]; then
+    cp /etc/skel/.zshrc ${ZDOTDIR:-$HOME}/.zshrc
+  elif [[ -w ${ZDOTDIR:-$HOME}/.zshrc ]] && \
+       grep -q 'zsh-autosuggestions' ${ZDOTDIR:-$HOME}/.zshrc 2>/dev/null && \
+       ! grep -q 'autosuggest-accept' ${ZDOTDIR:-$HOME}/.zshrc 2>/dev/null; then
+    printf "\n# Accept the inline suggestion with Ctrl+/ (traditional ^_ and CSI u ^[[47;5u)\nbindkey '^_' autosuggest-accept\nbindkey '^[[47;5u' autosuggest-accept\n" >> ${ZDOTDIR:-$HOME}/.zshrc
+  fi
 fi

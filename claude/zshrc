@@ -21,8 +21,9 @@ plugins=(
 )
 source "$ZSH/oh-my-zsh.sh"
 
-# Accept the inline suggestion with Ctrl+/
+# Accept the inline suggestion with Ctrl+/ (traditional ^_ and CSI u ^[[47;5u)
 bindkey '^_' autosuggest-accept
+bindkey '^[[47;5u' autosuggest-accept
 # Prefer shell history, then completion, when suggesting
 export ZSH_AUTOSUGGEST_STRATEGY=(history completion)
 # Show you-should-use reminders after command output
