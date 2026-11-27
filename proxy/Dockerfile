@@ -22,7 +22,7 @@ RUN set -eux; \
       arm64) xray_arch=arm64-v8a ;; \
       *) echo "unsupported arch: $arch" >&2; exit 1 ;; \
     esac; \
-    curl -fsSL "https://gh-proxy.com/https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VERSION}/Xray-linux-${xray_arch}.zip" -o /tmp/xray.zip; \
+    curl -fsSL "https://gh-proxy.org/https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VERSION}/Xray-linux-${xray_arch}.zip" -o /tmp/xray.zip; \
     python3 -c 'import zipfile; zipfile.ZipFile("/tmp/xray.zip").extract("xray", "/usr/local/bin")'; \
     rm -f /tmp/xray.zip; \
     chmod 0755 /usr/local/bin/xray
